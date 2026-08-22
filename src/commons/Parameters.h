@@ -484,7 +484,58 @@ public:
     // workflow
     std::string runner;
     bool reuseLatest;
+    std::string batchBackend;
+    size_t batchChunkMaxBytes;
+    size_t batchChunkMaxSeqs;
+    std::string batchSlurmNodelist;
+    std::string batchSlurmPartition;
+    std::string batchSlurmTime;
+    std::string batchSlurmMem;
+    std::string batchSlurmExtra;
+    std::string batchNodeWorkDir;
+    size_t batchRound0ChunkMaxBytes;
+    size_t batchRound0ChunkMaxSeqs;
+    std::string batchRound0SlurmNodelist;
+    std::string batchRound0SlurmPartition;
+    std::string batchRound0SlurmTime;
+    std::string batchRound0SlurmMem;
+    std::string batchRound0SlurmExtra;
+    std::string batchRound0NodeWorkDir;
+    float batchRound0SeqIdThr;
+    float batchRound0CovThr;
+    int batchRound0CovMode;
+    int batchRound0ClusteringMode;
+    int batchRound0KmersPerSequence;
+    bool batchRound0IncludeCountTable;
+    int batchRound0CountTableIteration;
+    bool batchRound0IncludeAdjacency;
+    int batchRound0AdjIteration;
+    bool batchRound0ClustHash;
+    size_t batchRound0SplitMemoryLimit;
+    int batchRound0PreloadMode;
+    int batchRound0Threads;
+    int batchRound0ShuffleSplits;
+    int batchRound0RepFastaSplits;
+    int batchMaxRounds;
+    float batchMinReductionRatio;
+    int batchConvergencePatience;
+    size_t batchMinReductionCount;
+    int batchMaxChunkAttempts;
+    bool batchCompressOutputs;
+    int batchMergeSplits;
+    int batchMergeSplitJobs;
+    int batchRepFastaSplits;
+    size_t batchChunkDiskBudget;
+    size_t batchRound0ChunkDiskBudget;
+    int batchDiskPollInterval;
+    int batchRamPollInterval;
     // former environment-only knobs; they affect results, so they belong on the command line
+    std::string batchRound0Mmseqs;
+    int batchRound0CreatedbMode;
+    int batchCompressRatio;
+    bool batchDeleteSourceChunk;
+    std::string batchSortTmpDir;
+    std::string batchSortBufferSize;
 
     // CLUSTERING
     int    clusteringMode;
@@ -613,6 +664,7 @@ public:
     bool clustHash;
     int linclustVersion;
     int linclust2Iter;
+    int batchRound0Linclust2Iter;
     int clusterVersion;
 
     // indexdb
@@ -636,6 +688,7 @@ public:
 
     // convert2fasta
     bool useHeaderFile;
+    int fastaSplits;
     int writeLookup;
 
     // result2flat
@@ -989,11 +1042,63 @@ public:
     PARAMETER(PARAM_CLUST_HASH)
     PARAMETER(PARAM_LINCLUST_VERSION)
     PARAMETER(PARAM_LINCLUST2_ITER)
+    PARAMETER(PARAM_BATCH_ROUND0_LINCLUST2_ITER)
     PARAMETER(PARAM_CLUSTER_VERSION)
 
     // workflow
     PARAMETER(PARAM_RUNNER)
     PARAMETER(PARAM_REUSELATEST)
+    PARAMETER(PARAM_BATCH_BACKEND)
+    PARAMETER(PARAM_BATCH_CHUNK_MAX_BYTES)
+    PARAMETER(PARAM_BATCH_CHUNK_MAX_SEQS)
+    PARAMETER(PARAM_BATCH_SLURM_NODELIST)
+    PARAMETER(PARAM_BATCH_SLURM_PARTITION)
+    PARAMETER(PARAM_BATCH_SLURM_TIME)
+    PARAMETER(PARAM_BATCH_SLURM_MEM)
+    PARAMETER(PARAM_BATCH_SLURM_EXTRA)
+    PARAMETER(PARAM_BATCH_NODE_WORK_DIR)
+    PARAMETER(PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES)
+    PARAMETER(PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS)
+    PARAMETER(PARAM_BATCH_ROUND0_SLURM_NODELIST)
+    PARAMETER(PARAM_BATCH_ROUND0_SLURM_PARTITION)
+    PARAMETER(PARAM_BATCH_ROUND0_SLURM_TIME)
+    PARAMETER(PARAM_BATCH_ROUND0_SLURM_MEM)
+    PARAMETER(PARAM_BATCH_ROUND0_SLURM_EXTRA)
+    PARAMETER(PARAM_BATCH_ROUND0_NODE_WORK_DIR)
+    PARAMETER(PARAM_BATCH_ROUND0_MIN_SEQ_ID)
+    PARAMETER(PARAM_BATCH_ROUND0_C)
+    PARAMETER(PARAM_BATCH_ROUND0_COV_MODE)
+    PARAMETER(PARAM_BATCH_ROUND0_CLUSTER_MODE)
+    PARAMETER(PARAM_BATCH_ROUND0_KMER_PER_SEQ)
+    PARAMETER(PARAM_BATCH_ROUND0_INCLUDE_COUNTTABLE)
+    PARAMETER(PARAM_BATCH_ROUND0_NUM_COUNTS)
+    PARAMETER(PARAM_BATCH_ROUND0_INCLUDE_ADJACENCY)
+    PARAMETER(PARAM_BATCH_ROUND0_NUM_ADJACENCY)
+    PARAMETER(PARAM_BATCH_ROUND0_CLUST_HASH)
+    PARAMETER(PARAM_BATCH_ROUND0_SPLIT_MEMORY_LIMIT)
+    PARAMETER(PARAM_BATCH_ROUND0_PRELOAD_MODE)
+    PARAMETER(PARAM_BATCH_ROUND0_THREADS)
+    PARAMETER(PARAM_BATCH_ROUND0_SHUFFLE_SPLITS)
+    PARAMETER(PARAM_BATCH_MAX_ROUNDS)
+    PARAMETER(PARAM_BATCH_MIN_REDUCTION_RATIO)
+    PARAMETER(PARAM_BATCH_CONVERGENCE_PATIENCE)
+    PARAMETER(PARAM_BATCH_MIN_REDUCTION_COUNT)
+    PARAMETER(PARAM_BATCH_MAX_CHUNK_ATTEMPTS)
+    PARAMETER(PARAM_BATCH_COMPRESS_OUTPUTS)
+    PARAMETER(PARAM_BATCH_MERGE_SPLITS)
+    PARAMETER(PARAM_BATCH_MERGE_SPLIT_JOBS)
+    PARAMETER(PARAM_BATCH_REP_FASTA_SPLITS)
+    PARAMETER(PARAM_BATCH_ROUND0_REP_FASTA_SPLITS)
+    PARAMETER(PARAM_BATCH_CHUNK_DISK_BUDGET)
+    PARAMETER(PARAM_BATCH_ROUND0_CHUNK_DISK_BUDGET)
+    PARAMETER(PARAM_BATCH_DISK_POLL_INTERVAL)
+    PARAMETER(PARAM_BATCH_RAM_POLL_INTERVAL)
+    PARAMETER(PARAM_BATCH_ROUND0_MMSEQS)
+    PARAMETER(PARAM_BATCH_ROUND0_CREATEDB_MODE)
+    PARAMETER(PARAM_BATCH_COMPRESS_RATIO)
+    PARAMETER(PARAM_BATCH_DELETE_SOURCE_CHUNK)
+    PARAMETER(PARAM_BATCH_SORT_TMP_DIR)
+    PARAMETER(PARAM_BATCH_SORT_BUFFER_SIZE)
 
     // search workflow
     PARAMETER(PARAM_NUM_ITERATIONS)
@@ -1043,6 +1148,7 @@ public:
 
     // convert2fasta
     PARAMETER(PARAM_USE_HEADER_FILE)
+    PARAMETER(PARAM_FASTA_SPLITS)
 
     // setextendedbtype
     PARAMETER(PARAM_EXTENDED_DBTYPE)
