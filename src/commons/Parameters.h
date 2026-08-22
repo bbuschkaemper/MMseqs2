@@ -282,6 +282,9 @@ public:
     static const int CLUST_LINEAR_DEFAULT_ALPH_SIZE = 13;
     static const int CLUST_LINEAR_DEFAULT_K = 0;
     static const int CLUST_LINEAR_KMER_PER_SEQ = 0;
+    static const int CLUST_LINEAR_DEFAULT_NUM_COUNT_TABLE = 2;   // count-table iters (symmetric cov-mode)
+    static const int CLUST_LINEAR_DEFAULT_NUM_ADJACENCY = 3;     // adjacency iters (non-symmetric cov-mode)
+    static const int CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY = 1;   // adjacency iters (symmetric cov-mode)
 
     // cov mode
     static const int COV_MODE_BIDIRECTIONAL  = 0;
@@ -578,6 +581,8 @@ public:
     int idxSeqSrc;
     bool fullHeader;
     size_t targetTsvColumn;
+    int tsvSplits;
+    int tsvSplitColumn;
 
     //result2stats
     std::string stat;
@@ -607,6 +612,7 @@ public:
     int adjIteration;
     bool clustHash;
     int linclustVersion;
+    int linclust2Iter;
     int clusterVersion;
 
     // indexdb
@@ -952,6 +958,8 @@ public:
     PARAMETER(PARAM_FIRST_SEQ_REP_SEQ)
     PARAMETER(PARAM_FULL_HEADER)
     PARAMETER(PARAM_IDX_SEQ_SRC)
+    PARAMETER(PARAM_TSV_SPLITS)
+    PARAMETER(PARAM_TSV_SPLIT_COLUMN)
 
     // result2stat
     PARAMETER(PARAM_STAT)
@@ -980,6 +988,7 @@ public:
     PARAMETER(PARAM_KMERMATCHER_MODE)
     PARAMETER(PARAM_CLUST_HASH)
     PARAMETER(PARAM_LINCLUST_VERSION)
+    PARAMETER(PARAM_LINCLUST2_ITER)
     PARAMETER(PARAM_CLUSTER_VERSION)
 
     // workflow

@@ -6,6 +6,12 @@
 #include "IndexReader.h"
 #include "FileUtil.h"
 
+#include <mutex>
+#include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
+
 #ifdef OPENMP
 #include <omp.h>
 
@@ -14,6 +20,42 @@
 #ifndef SIZE_T_MAX
 #define SIZE_T_MAX ((size_t) -1)
 #endif
+
+// byte-identical port of batch_clustering.sh SPLIT_HASH_AWK: h = (h*131 + byte) % B over the column's bytes
+static unsigned int tsvSplitOfColumn(const std::string &line, int column, unsigned int splits) {
+    size_t start = 0;
+    for (int c = 1; c < column; ++c) {
+        size_t tab = line.find('\t', start);
+        start = (tab == std::string::npos) ? line.size() : tab + 1;
+    }
+    uint64_t h = 0;
+    for (size_t i = start; i < line.size(); ++i) {
+        const unsigned char byte = line[i];
+        if (byte == '\t' || byte == '\n') {
+            break;
+        }
+        h = (h * 131 + byte) % splits;
+    }
+    return (unsigned int) h;
+}
+
+// the tsv output would otherwise sit in page cache the header lookups need, so retire it behind the writer
+static void retireSplit(FILE *file, size_t written, size_t &retired) {
+#if defined(__linux__)
+    const size_t stride = 64 * 1024 * 1024, lag = 32 * 1024 * 1024;
+    if (written < retired + stride + lag) {
+        return;
+    }
+    const size_t upto = written - lag;
+    sync_file_range(fileno(file), static_cast<off_t>(retired), static_cast<off_t>(upto - retired),
+                    SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
+    posix_fadvise(fileno(file), static_cast<off_t>(retired), static_cast<off_t>(upto - retired),
+                  POSIX_FADV_DONTNEED);
+    retired = upto;
+#else
+    (void) file; (void) written; (void) retired;
+#endif
+}
 
 int createtsv(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
@@ -76,8 +118,27 @@ int createtsv(int argc, const char **argv, const Command &command) {
     const std::string& indexFile = hasTargetDB ? par.db4Index : par.db3Index;
     const bool shouldCompress = par.dbOut == true && par.compressed == true;
     const int dbType = par.dbOut == true ? Parameters::DBTYPE_GENERIC_DB : Parameters::DBTYPE_OMIT_FILE;
+    // opt-in split mode (batch clustering): dataFile becomes a prefix for <prefix>.split%05d.tsv
+    const unsigned int splits = par.tsvSplits > 0 ? (unsigned int) par.tsvSplits : 0;
+    const bool splitMode = splits > 0;
+    if (splitMode && par.dbOut) {
+        Debug(Debug::ERROR) << "--tsv-splits cannot be combined with --db-output\n";
+        return EXIT_FAILURE;
+    }
     DBWriter writer(dataFile.c_str(), indexFile.c_str(), par.threads, shouldCompress, dbType);
-    writer.open();
+    std::vector<FILE*> splitFiles(splitMode ? splits : 0);
+    std::vector<std::mutex> splitLocks(splitMode ? splits : 0);
+    std::vector<size_t> splitWritten(splitMode ? splits : 0, 0), splitRetired(splitMode ? splits : 0, 0);
+    if (splitMode) {
+        char splitName[FILENAME_MAX];
+        for (unsigned int b = 0; b < splits; ++b) {
+            snprintf(splitName, sizeof(splitName), "%s.split%05u.tsv", dataFile.c_str(), b);
+            splitFiles[b] = FileUtil::openAndDelete(splitName, "w");
+            setvbuf(splitFiles[b], NULL, _IONBF, 0);
+        }
+    } else {
+        writer.open();
+    }
 
     const size_t targetColumn = (par.targetTsvColumn == 0) ? SIZE_T_MAX :  par.targetTsvColumn - 1;
 #pragma omp parallel
@@ -92,6 +153,10 @@ int createtsv(int argc, const char **argv, const Command &command) {
 
         std::string outputBuffer;
         outputBuffer.reserve(10 * 1024);
+        std::string lineBuffer;
+        lineBuffer.reserve(1024);
+        const size_t splitFlushSize = 64 * 1024;
+        std::vector<std::string> splitBuffers(splitMode ? splits : 0);
 
 #pragma omp for schedule(dynamic, 1000)
         for (size_t i = 0; i < reader->getSize(); ++i) {
@@ -135,10 +200,12 @@ int createtsv(int argc, const char **argv, const Command &command) {
                     targetAccession = "";
                 } else if (hasTargetDB) {
                     DBKeyType targetKey = Util::fast_atoi<DBKeyType>(dbKey);
-                    size_t targetIndex = targetDB->getId(targetKey);
-                    char *targetData;
-                    if(needSET == false) {
-                        targetData = targetDB->getData(targetIndex, thread_idx);
+                    // a cluster holds its own representative; --first-seq-as-repr rebinds queryHeader, so it opts out
+                    if (needSET == false && par.firstSeqRepr == false && targetDB == queryDB && targetKey == queryKey) {
+                        targetAccession = queryHeader;
+                    } else if (needSET == false) {
+                        size_t targetIndex = targetDB->getId(targetKey);
+                        char *targetData = targetDB->getData(targetIndex, thread_idx);
                         if (targetData == NULL) {
                             Debug(Debug::WARNING) << "Invalid header entry in query " << queryKey << " and target " << targetKey << "!\n";
                             continue;
@@ -161,36 +228,81 @@ int createtsv(int argc, const char **argv, const Command &command) {
                     queryHeader = targetAccession;
                 }
 
-                outputBuffer.append(queryHeader);
-                outputBuffer.append("\t");
-                outputBuffer.append(targetAccession);
+                lineBuffer.clear();
+                lineBuffer.append(queryHeader);
+                lineBuffer.append("\t");
+                lineBuffer.append(targetAccession);
 
                 size_t offset = 0;
                 if (targetColumn != 0) {
-                    outputBuffer.append("\t");
+                    lineBuffer.append("\t");
                     offset = 0;
                 } else {
                     offset = strlen(dbKey);
                 }
 
                 char *nextLine = Util::skipLine(data);
-                outputBuffer.append(data + offset, (nextLine - (data + offset)) - 1);
-                outputBuffer.append("\n");
+                lineBuffer.append(data + offset, (nextLine - (data + offset)) - 1);
+                lineBuffer.append("\n");
+                if (splitMode) {
+                    const unsigned int b = tsvSplitOfColumn(lineBuffer, par.tsvSplitColumn, splits);
+                    std::string &buf = splitBuffers[b];
+                    buf.append(lineBuffer);
+                    if (buf.size() >= splitFlushSize) {
+                        std::lock_guard<std::mutex> lock(splitLocks[b]);
+                        if (fwrite(buf.c_str(), sizeof(char), buf.size(), splitFiles[b]) != buf.size()) {
+                            Debug(Debug::ERROR) << "Cannot write to split file " << b << "\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+#if defined(__linux__)
+                        sync_file_range(fileno(splitFiles[b]), static_cast<off_t>(splitWritten[b]),
+                                        static_cast<off_t>(buf.size()), SYNC_FILE_RANGE_WRITE);
+#endif
+                        splitWritten[b] += buf.size();
+                        retireSplit(splitFiles[b], splitWritten[b], splitRetired[b]);
+                        buf.clear();
+                    }
+                } else {
+                    outputBuffer.append(lineBuffer);
+                }
                 data = nextLine;
                 entryIndex++;
             }
-            writer.writeData(outputBuffer.c_str(), outputBuffer.length(), queryKey, thread_idx, par.dbOut);
-            outputBuffer.clear();
+            if (splitMode == false) {
+                writer.writeData(outputBuffer.c_str(), outputBuffer.length(), queryKey, thread_idx, par.dbOut);
+                outputBuffer.clear();
+            }
+        }
+        if (splitMode) {
+            for (unsigned int b = 0; b < splits; ++b) {
+                if (splitBuffers[b].empty()) {
+                    continue;
+                }
+                std::lock_guard<std::mutex> lock(splitLocks[b]);
+                if (fwrite(splitBuffers[b].c_str(), sizeof(char), splitBuffers[b].size(), splitFiles[b]) != splitBuffers[b].size()) {
+                    Debug(Debug::ERROR) << "Cannot write to split file " << b << "\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                splitBuffers[b].clear();
+            }
         }
         delete[] dbKey;
     }
-    writer.close(par.dbOut == false);
-
-    if (par.dbOut == false) {
-        if (hasTargetDB) {
-            FileUtil::remove(par.db4Index.c_str());
-        } else {
-            FileUtil::remove(par.db3Index.c_str());
+    if (splitMode) {
+        for (unsigned int b = 0; b < splits; ++b) {
+            if (fclose(splitFiles[b]) != 0) {
+                Debug(Debug::ERROR) << "Cannot close split file " << b << "\n";
+                return EXIT_FAILURE;
+            }
+        }
+    } else {
+        writer.close(par.dbOut == false);
+        if (par.dbOut == false) {
+            if (hasTargetDB) {
+                FileUtil::remove(par.db4Index.c_str());
+            } else {
+                FileUtil::remove(par.db3Index.c_str());
+            }
         }
     }
 

@@ -156,6 +156,8 @@ Parameters::Parameters():
         PARAM_FIRST_SEQ_REP_SEQ(PARAM_FIRST_SEQ_REP_SEQ_ID, "--first-seq-as-repr", "First sequence as representative", "Use the first sequence of the clustering result as representative sequence", typeid(bool), (void *) &firstSeqRepr, "", MMseqsParameter::COMMAND_MISC),
         PARAM_FULL_HEADER(PARAM_FULL_HEADER_ID, "--full-header", "Add full header", "Replace DB ID by its corresponding Full Header", typeid(bool), (void *) &fullHeader, ""),
         PARAM_IDX_SEQ_SRC(PARAM_IDX_SEQ_SRC_ID, "--idx-seq-src", "Sequence source", "0: auto, 1: split/translated sequences, 2: input sequences", typeid(int), (void *) &idxSeqSrc, "^[0-2]{1}$", MMseqsParameter::COMMAND_MISC),
+        PARAM_TSV_SPLITS(PARAM_TSV_SPLITS_ID, "--tsv-splits", "TSV hash splits", "Write N files <out>.split%05d.tsv routed by hashing --tsv-split-column. 0: single file", typeid(int), (void *) &tsvSplits, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_MISC | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_TSV_SPLIT_COLUMN(PARAM_TSV_SPLIT_COLUMN_ID, "--tsv-split-column", "TSV split column", "1-based column hashed to pick a row's split", typeid(int), (void *) &tsvSplitColumn, "^[12]$", MMseqsParameter::COMMAND_MISC | MMseqsParameter::COMMAND_EXPERT),
 
         // result2stats
         PARAM_STAT(PARAM_STAT_ID, "--stat", "Statistics to be computed", "One of: linecount, mean, min, max, doolittle, charges, seqlen, firstline", typeid(std::string), (void *) &stat, ""),
@@ -183,6 +185,7 @@ Parameters::Parameters():
         PARAM_KMERMATCHER_MODE(PARAM_KMERMATCHER_MODE_ID, "--kmermatcher-mode", "K-mer matcher mode", "1: database-key payloads (generic prefilter format), 2: local sequence-index payloads (linclust2/align2clust only)", typeid(int), (void *) &kmerMatcherMode, "^[1-2]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUST_HASH(PARAM_CLUST_HASH_ID, "--clust-hash", "Cluster hash", "Use clusthash before kmermatcher in linclust", typeid(bool), (void *) &clustHash, "^[0-1]{0}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST_VERSION(PARAM_LINCLUST_VERSION_ID, "--linclust-version", "Linclust version", "Linclust version: 1: Linclust1, 2: Linclust2", typeid(int), (void *) &linclustVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_LINCLUST2_ITER(PARAM_LINCLUST2_ITER_ID, "--linclust2-iter", "Linclust2 iterations", "Iterations of linclust2. 2 re-clusters the representatives, 1 stops after the first iteration", typeid(int), (void *) &linclust2Iter, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUSTER_VERSION(PARAM_CLUSTER_VERSION_ID, "--cluster-version", "Cluster version", "Cluster version: 1: Cluster1, 2: Cluster2", typeid(int), (void *) &clusterVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         // workflow
         PARAM_RUNNER(PARAM_RUNNER_ID, "--mpi-runner", "MPI runner", "Use MPI on compute cluster with this MPI command (e.g. \"mpirun -np 42\")", typeid(std::string), (void *) &runner, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
@@ -653,6 +656,8 @@ Parameters::Parameters():
     // createtsv
     createtsv.push_back(&PARAM_FIRST_SEQ_REP_SEQ);
     createtsv.push_back(&PARAM_TARGET_COLUMN);
+    createtsv.push_back(&PARAM_TSV_SPLITS);
+    createtsv.push_back(&PARAM_TSV_SPLIT_COLUMN);
     createtsv.push_back(&PARAM_FULL_HEADER);
     createtsv.push_back(&PARAM_IDX_SEQ_SRC);
     createtsv.push_back(&PARAM_DB_OUTPUT);
@@ -1529,6 +1534,7 @@ Parameters::Parameters():
     linclustworkflow = combineList(linclustworkflow, rescorediagonal);
     linclustworkflow = combineList(linclustworkflow, align2clust);
     linclustworkflow = combineList(linclustworkflow, clusthash);
+    linclustworkflow.push_back(&PARAM_LINCLUST2_ITER);
     linclustworkflow.push_back(&PARAM_SWITCH_CONSENSUS_REP);
     linclustworkflow.push_back(&PARAM_CLUST_HASH);
     linclustworkflow.push_back(&PARAM_REMOVE_TMP_FILES);
@@ -1586,6 +1592,7 @@ Parameters::Parameters():
     linclustbatchinner.push_back(&PARAM_KMERMATCHER_MODE);
     linclustbatchinner.push_back(&PARAM_CLUST_HASH);
     linclustbatchinner.push_back(&PARAM_LINCLUST_VERSION);
+    linclustbatchinner.push_back(&PARAM_LINCLUST2_ITER);
     linclustbatch = combineList(linclustbatchinner, batchserver);
     linclustbatchaws = combineList(linclustbatchinner, batchaws);
     linclustbatchall = combineList(linclustbatchinner, batchclustering);
@@ -2913,10 +2920,13 @@ void Parameters::setDefaults() {
     kmerWriteToDisk = false;
     kmerMatcherMode = Parameters::KMERMATCHER_MODE_KEY;
     includeCountTable = true;
+    countTableIteration = CLUST_LINEAR_DEFAULT_NUM_COUNT_TABLE;
     countTableScale = 0.1;
     includeAdjacency = true;
+    adjIteration = CLUST_LINEAR_DEFAULT_NUM_ADJACENCY;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;
+    linclust2Iter = 2;
     clusterVersion = CLUSTER_VERSION1;
 
     // result2stats
@@ -2927,6 +2937,8 @@ void Parameters::setDefaults() {
     fullHeader = false;
     idxSeqSrc = 0;
     targetTsvColumn = 1;
+    tsvSplits = 0;
+    tsvSplitColumn = 1;
 
     // createtaxdb
     taxMappingFile = "";
