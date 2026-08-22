@@ -493,6 +493,13 @@ public:
     std::string batchSlurmMem;
     std::string batchSlurmExtra;
     std::string batchNodeWorkDir;
+    std::string batchAwsMachine;
+    std::string batchAwsJobQueue;
+    std::string batchAwsJobDefinition;
+    std::string batchRound0AwsMachine;
+    std::string batchRound0AwsJobQueue;
+    std::string batchRound0AwsJobDefinition;
+    std::string batchAwsMachineTagKey;
     size_t batchRound0ChunkMaxBytes;
     size_t batchRound0ChunkMaxSeqs;
     std::string batchRound0SlurmNodelist;
@@ -536,6 +543,16 @@ public:
     bool batchDeleteSourceChunk;
     std::string batchSortTmpDir;
     std::string batchSortBufferSize;
+    std::string batchAwsMmseqs;
+    std::string batchRound0AwsMmseqs;
+    std::string batchAwsJobPrefix;
+    std::string batchAwsLocalDir;
+    std::string batchAwsScriptUri;
+    std::string batchAwsChunkPrefix;
+    int batchAwsTimeout;
+    int batchAwsWorkerAttempts;
+    bool batchAwsDryRun;
+    bool batchAwsAllowNonS3Input;
 
     // CLUSTERING
     int    clusteringMode;
@@ -1057,6 +1074,13 @@ public:
     PARAMETER(PARAM_BATCH_SLURM_MEM)
     PARAMETER(PARAM_BATCH_SLURM_EXTRA)
     PARAMETER(PARAM_BATCH_NODE_WORK_DIR)
+    PARAMETER(PARAM_BATCH_AWS_MACHINE)
+    PARAMETER(PARAM_BATCH_AWS_JOB_QUEUE)
+    PARAMETER(PARAM_BATCH_AWS_JOB_DEFINITION)
+    PARAMETER(PARAM_BATCH_ROUND0_AWS_MACHINE)
+    PARAMETER(PARAM_BATCH_ROUND0_AWS_JOB_QUEUE)
+    PARAMETER(PARAM_BATCH_ROUND0_AWS_JOB_DEFINITION)
+    PARAMETER(PARAM_BATCH_AWS_MACHINE_TAG_KEY)
     PARAMETER(PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES)
     PARAMETER(PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS)
     PARAMETER(PARAM_BATCH_ROUND0_SLURM_NODELIST)
@@ -1099,6 +1123,16 @@ public:
     PARAMETER(PARAM_BATCH_DELETE_SOURCE_CHUNK)
     PARAMETER(PARAM_BATCH_SORT_TMP_DIR)
     PARAMETER(PARAM_BATCH_SORT_BUFFER_SIZE)
+    PARAMETER(PARAM_BATCH_AWS_MMSEQS)
+    PARAMETER(PARAM_BATCH_ROUND0_AWS_MMSEQS)
+    PARAMETER(PARAM_BATCH_AWS_JOB_PREFIX)
+    PARAMETER(PARAM_BATCH_AWS_LOCAL_DIR)
+    PARAMETER(PARAM_BATCH_AWS_SCRIPT_URI)
+    PARAMETER(PARAM_BATCH_AWS_CHUNK_PREFIX)
+    PARAMETER(PARAM_BATCH_AWS_TIMEOUT)
+    PARAMETER(PARAM_BATCH_AWS_WORKER_ATTEMPTS)
+    PARAMETER(PARAM_BATCH_AWS_DRY_RUN)
+    PARAMETER(PARAM_BATCH_AWS_ALLOW_NONS3_INPUT)
 
     // search workflow
     PARAMETER(PARAM_NUM_ITERATIONS)

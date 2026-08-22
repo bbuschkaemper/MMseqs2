@@ -251,7 +251,8 @@ void validateBatchServerBackend(Parameters &par, const Command &command) {
 
     if (par.batchBackend == "single-node") {
         if (isS3Uri(par.db2) || isS3Uri(par.db3)) {
-            Debug(Debug::ERROR) << "--backend single-node requires local <resultDir> and <tmpDir>.\n";
+            Debug(Debug::ERROR) << "--backend single-node requires local <resultDir> and <tmpDir>. Use mmseqs "
+                                << command.cmd << "-aws for S3 paths.\n";
             EXIT(EXIT_FAILURE);
         }
         if (hasSlurmParameters(par)) {
@@ -263,7 +264,8 @@ void validateBatchServerBackend(Parameters &par, const Command &command) {
 
     if (par.batchBackend == "multi-node") {
         if (isS3Uri(par.db2) || isS3Uri(par.db3)) {
-            Debug(Debug::ERROR) << "--backend multi-node requires shared local <resultDir> and <tmpDir>.\n";
+            Debug(Debug::ERROR) << "--backend multi-node requires shared local <resultDir> and <tmpDir>. Use mmseqs "
+                                << command.cmd << "-aws for S3 paths.\n";
             EXIT(EXIT_FAILURE);
         }
         size_t nodeCount = getSlurmNodeCount(par);
@@ -291,10 +293,33 @@ void validateBatchServerBackend(Parameters &par, const Command &command) {
         return;
     }
 
+    if (par.batchBackend == "aws-batch") {
+        Debug(Debug::ERROR) << "The aws-batch backend moved to its own command. Use mmseqs "
+                            << command.cmd << "-aws (same arguments, without --backend).\n";
+        EXIT(EXIT_FAILURE);
+    }
 
     Debug(Debug::ERROR) << "Invalid --backend " << par.batchBackend
-                        << ". Valid values are single-node and multi-node.\n";
+                        << ". Valid values are single-node and multi-node; for AWS Batch use mmseqs "
+                        << command.cmd << "-aws.\n";
     EXIT(EXIT_FAILURE);
+}
+
+void validateBatchAwsBackend(Parameters &par, const Command &command) {
+    validateBatchCreatedbMode(par);
+
+    if (par.batchNodeWorkDir.empty()) {
+        Debug(Debug::ERROR) << "mmseqs " << command.cmd << " requires --node-work-dir (a container-local disk path). Without it each chunk's createdb/cluster tmp defaults to the container /tmp, which is often too small at batch scale.\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (isS3Uri(par.batchNodeWorkDir)) {
+        Debug(Debug::ERROR) << "--node-work-dir must be a container-LOCAL disk path, not an s3:// URI.\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (par.batchRound0NodeWorkDir.empty() == false && isS3Uri(par.batchRound0NodeWorkDir)) {
+        Debug(Debug::ERROR) << "--round0-node-work-dir must be a container-LOCAL disk path, not an s3:// URI.\n";
+        EXIT(EXIT_FAILURE);
+    }
 }
 
 std::string getBatchSubmitTmpBase() {
@@ -565,6 +590,54 @@ void addBatchEngineVariables(CommandCaller &cmd, const Parameters &par,
     cmd.addVariable("ROUND0_BATCH_SLURM_MEM", par.batchRound0SlurmMem.empty() ? NULL : par.batchRound0SlurmMem.c_str());
     cmd.addVariable("ROUND0_BATCH_SLURM_EXTRA", par.batchRound0SlurmExtra.empty() ? NULL : par.batchRound0SlurmExtra.c_str());
     cmd.addVariable("ROUND0_NODE_WORK_DIR", par.batchRound0NodeWorkDir.empty() ? NULL : par.batchRound0NodeWorkDir.c_str());
+    if (par.PARAM_BATCH_AWS_MACHINE.wasSet) {
+        cmd.addVariable("BATCH_AWS_MACHINE", par.batchAwsMachine.c_str());
+    }
+    if (par.PARAM_BATCH_AWS_JOB_QUEUE.wasSet) {
+        cmd.addVariable("BATCH_AWS_JOB_QUEUE", par.batchAwsJobQueue.c_str());
+    }
+    if (par.PARAM_BATCH_AWS_JOB_DEFINITION.wasSet) {
+        cmd.addVariable("BATCH_AWS_JOB_DEFINITION", par.batchAwsJobDefinition.c_str());
+    }
+    if (par.PARAM_BATCH_ROUND0_AWS_MACHINE.wasSet) {
+        cmd.addVariable("ROUND0_BATCH_AWS_MACHINE", par.batchRound0AwsMachine.c_str());
+    }
+    if (par.PARAM_BATCH_ROUND0_AWS_JOB_QUEUE.wasSet) {
+        cmd.addVariable("ROUND0_BATCH_AWS_JOB_QUEUE", par.batchRound0AwsJobQueue.c_str());
+    }
+    if (par.PARAM_BATCH_ROUND0_AWS_JOB_DEFINITION.wasSet) {
+        cmd.addVariable("ROUND0_BATCH_AWS_JOB_DEFINITION", par.batchRound0AwsJobDefinition.c_str());
+    }
+    if (par.PARAM_BATCH_AWS_MACHINE_TAG_KEY.wasSet) {
+        cmd.addVariable("BATCH_AWS_MACHINE_TAG_KEY", par.batchAwsMachineTagKey.c_str());
+    }
+
+    // former environment-only knobs; empty keeps the shell's derive-it path
+    cmd.addVariable("ROUND0_MMSEQS", par.batchRound0Mmseqs.c_str());
+    cmd.addVariable("ROUND0_CREATEDB_MODE", SSTR(par.batchRound0CreatedbMode).c_str());
+    cmd.addVariable("COMPRESS_RATIO", SSTR(par.batchCompressRatio).c_str());
+    cmd.addVariable("BATCH_DELETE_SOURCE_CHUNK", par.batchDeleteSourceChunk ? "1" : "0");
+    cmd.addVariable("SORT_TMP", par.batchSortTmpDir.c_str());
+    // the shell tests for unset to derive it, so only export a real override
+    if (par.batchSortBufferSize.empty() == false) {
+        cmd.addVariable("SORT_BUFFER_SIZE", par.batchSortBufferSize.c_str());
+    }
+    cmd.addVariable("BATCH_AWS_MMSEQS", par.batchAwsMmseqs.c_str());
+    cmd.addVariable("ROUND0_BATCH_AWS_MMSEQS", par.batchRound0AwsMmseqs.c_str());
+    cmd.addVariable("BATCH_AWS_JOB_PREFIX", par.batchAwsJobPrefix.c_str());
+    cmd.addVariable("BATCH_AWS_LOCAL_DIR", par.batchAwsLocalDir.c_str());
+    cmd.addVariable("BATCH_AWS_TIMEOUT", SSTR(par.batchAwsTimeout).c_str());
+    cmd.addVariable("BATCH_AWS_ALLOW_NONS3_INPUT", par.batchAwsAllowNonS3Input ? "1" : "0");
+    cmd.addVariable("BATCH_AWS_DRY_RUN", par.batchAwsDryRun ? "1" : NULL);
+    // derived from the work prefix when empty
+    if (par.batchAwsScriptUri.empty() == false) {
+        cmd.addVariable("BATCH_AWS_SCRIPT_URI", par.batchAwsScriptUri.c_str());
+    }
+    if (par.batchAwsChunkPrefix.empty() == false) {
+        cmd.addVariable("S3_CHUNK_PREFIX", par.batchAwsChunkPrefix.c_str());
+    }
+    cmd.addVariable("BATCH_AWS_WORKER_ATTEMPTS",
+                    par.batchAwsWorkerAttempts > 0 ? SSTR(par.batchAwsWorkerAttempts).c_str() : NULL);
 }
 
 int execBatchEngine(Parameters &par, const std::string &programDir,
@@ -648,6 +721,28 @@ int runBatchMultiNode(Parameters &par, const Command &command,
     return execBatchEngine(par, tmpDir, "run-multi-node", args, clusterCmd, clusterPar, round0ClusterPar);
 }
 
+int runBatchAwsBatch(Parameters &par, const Command &command,
+                     const std::vector<MMseqsParameter*> &paramList,
+                     const std::string &clusterCmd, const std::string &clusterPar,
+                     const std::string &round0ClusterPar) {
+    if (isS3Uri(par.db2) == false || isS3Uri(par.db3) == false) {
+        Debug(Debug::ERROR)
+            << "mmseqs " << command.cmd << " requires S3 prefixes for <resultDir> and <tmpDir>.\n"
+            << "Example: mmseqs " << command.cmd
+            << " s3://bucket/input.manifest s3://bucket/results/run1 s3://bucket/work/run1\n";
+        EXIT(EXIT_FAILURE);
+    }
+
+    std::string hash = SSTR(par.hashParameter(command.databases, par.filenames, paramList));
+    std::string programDir = createBatchSubmitDirectory(hash);
+
+    std::vector<std::string> args;
+    args.push_back(par.db1);
+    args.push_back(par.db3);
+    args.push_back(par.db2);
+    return execBatchEngine(par, programDir, "aws-submit", args, clusterCmd, clusterPar, round0ClusterPar);
+}
+
 int runBatchClustering(Parameters &par, const Command &command,
                        const std::vector<MMseqsParameter*> &paramList,
                        const std::string &clusterCmd, const std::string &clusterPar,
@@ -656,6 +751,9 @@ int runBatchClustering(Parameters &par, const Command &command,
         Debug(Debug::WARNING) << "--remove-tmp-files 0: per-chunk temporary files are KEPT and "
                                  "accumulate across all chunks and rounds. At batch scale this can "
                                  "fill the working disk. Use only for debugging a small input.\n";
+    }
+    if (par.batchBackend == "aws-batch") {
+        return runBatchAwsBatch(par, command, paramList, clusterCmd, clusterPar, round0ClusterPar);
     }
     if (par.batchBackend == "multi-node") {
         return runBatchMultiNode(par, command, paramList, clusterCmd, clusterPar, round0ClusterPar);
@@ -687,6 +785,14 @@ void setBatchClusteringDescriptions(Parameters &par) {
         par.PARAM_BATCH_COMPRESS_OUTPUTS.category);
 }
 
+void setBatchAwsDescriptions(Parameters &par) {
+    par.overrideParameterDescription(
+        par.PARAM_BATCH_NODE_WORK_DIR,
+        "Container-LOCAL disk for chunk tasks (createdb/cluster tmp + sort spill). REQUIRED; mount a real volume at this path in the job definition",
+        NULL,
+        par.PARAM_BATCH_NODE_WORK_DIR.category);
+}
+
 } // namespace
 
 int linclustbatch(int argc, const char **argv, const Command &command) {
@@ -708,6 +814,23 @@ int linclustbatch(int argc, const char **argv, const Command &command) {
     return runBatchClustering(par, command, par.linclustbatch, "linclust", clusterPar, round0ClusterPar);
 }
 
+int linclustbatchaws(int argc, const char **argv, const Command &command) {
+    Parameters &par = Parameters::getInstance();
+    int requestedThreads = parseRequestedThreads(argc, argv);
+    setBatchLinclustDefaults(&par);
+    setBatchClusteringDescriptions(par);
+    setBatchAwsDescriptions(par);
+    par.parseParameters(argc, argv, command, false, 0, 0);
+    restoreRequestedThreads(par, requestedThreads);
+    resolveBatchMergeParallelism(par);
+    par.batchBackend = "aws-batch";
+    validateBatchAwsBackend(par, command);
+    std::string round0ClusterPar = buildRound0ClusterPar(par, "linclust");
+    std::string clusterPar = buildInnerClusterPar(par, "linclust");
+    par.printParameters(command.cmd, argc, argv, *command.params);
+    return runBatchClustering(par, command, par.linclustbatchaws, "linclust", clusterPar, round0ClusterPar);
+}
+
 int clusterbatch(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     int requestedThreads = parseRequestedThreads(argc, argv);
@@ -725,6 +848,23 @@ int clusterbatch(int argc, const char **argv, const Command &command) {
     std::string clusterPar = buildInnerClusterPar(par, "cluster");
     par.printParameters(command.cmd, argc, argv, *command.params);
     return runBatchClustering(par, command, par.clusterbatch, "cluster", clusterPar, round0ClusterPar);
+}
+
+int clusterbatchaws(int argc, const char **argv, const Command &command) {
+    Parameters &par = Parameters::getInstance();
+    int requestedThreads = parseRequestedThreads(argc, argv);
+    setBatchClusterDefaults(&par);
+    setBatchClusteringDescriptions(par);
+    setBatchAwsDescriptions(par);
+    par.parseParameters(argc, argv, command, false, 0, 0);
+    restoreRequestedThreads(par, requestedThreads);
+    resolveBatchMergeParallelism(par);
+    par.batchBackend = "aws-batch";
+    validateBatchAwsBackend(par, command);
+    std::string round0ClusterPar = buildRound0ClusterPar(par, "linclust", true);
+    std::string clusterPar = buildInnerClusterPar(par, "cluster");
+    par.printParameters(command.cmd, argc, argv, *command.params);
+    return runBatchClustering(par, command, par.clusterbatchaws, "cluster", clusterPar, round0ClusterPar);
 }
 
 int linclustbatchworker(int argc, const char **argv, const Command &command) {
