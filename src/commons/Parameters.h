@@ -87,6 +87,7 @@ public:
     static const int DBTYPE_SEQTAXDB = 18; // needed for verification
     static const int DBTYPE_STDIN = 19; // needed for verification
     static const int DBTYPE_URI = 20; // needed for verification
+    static const int DBTYPE_PREFILTER_LOCAL_RES = 21;
 
     static const unsigned int DBTYPE_EXTENDED_COMPRESSED = 1;
     static const unsigned int DBTYPE_EXTENDED_INDEX_NEED_SRC = 2;
@@ -98,6 +99,8 @@ public:
 
     static const int LINCLUST_VERSION1 = 1;
     static const int LINCLUST_VERSION2 = 2;
+    static const int KMERMATCHER_MODE_KEY = 1;
+    static const int KMERMATCHER_MODE_LOCAL = 2;
     static const int CLUSTER_VERSION1 = 1;
     static const int CLUSTER_VERSION2 = 2;
 
@@ -585,6 +588,8 @@ public:
     bool includeOnlyExtendable;
     bool ignoreMultiKmer;
     int hashShift;
+    int kmerSelection;
+    int syncmerS;
     int pickNbest;
     int adjustKmerLength;
     int resultDirection;
@@ -592,6 +597,9 @@ public:
     std::string weightFile;
     bool useParallelism;
     bool needWriteBuffer;
+    int compressKmerTmpFiles;
+    bool kmerWriteToDisk;
+    int kmerMatcherMode;
     bool includeCountTable;
     int countTableIteration;
     float countTableScale;
@@ -954,6 +962,8 @@ public:
     PARAMETER(PARAM_INCLUDE_ONLY_EXTENDABLE)
     PARAMETER(PARAM_IGNORE_MULTI_KMER)
     PARAMETER(PARAM_HASH_SHIFT)
+    PARAMETER(PARAM_KMER_SELECTION)
+    PARAMETER(PARAM_SYNCMER_S)
     PARAMETER(PARAM_PICK_N_SIMILAR)
     PARAMETER(PARAM_ADJUST_KMER_LEN)
     PARAMETER(PARAM_RESULT_DIRECTION)
@@ -965,6 +975,9 @@ public:
     PARAMETER(PARAM_NUM_ADJACENCY)
     PARAMETER(PARAM_USE_PARALLELISM)
     PARAMETER(PARAM_NEED_WRITEBUFFER)
+    PARAMETER(PARAM_COMPRESS_KMER_TMP_FILES)
+    PARAMETER(PARAM_KMER_WRITE_TO_DISK)
+    PARAMETER(PARAM_KMERMATCHER_MODE)
     PARAMETER(PARAM_CLUST_HASH)
     PARAMETER(PARAM_LINCLUST_VERSION)
     PARAMETER(PARAM_CLUSTER_VERSION)
@@ -1373,6 +1386,7 @@ public:
             case DBTYPE_FLATFILE: return "Flatfile";
             case DBTYPE_STDIN: return "stdin";
             case DBTYPE_URI: return "uri";
+            case DBTYPE_PREFILTER_LOCAL_RES: return "Local-ID prefilter";
 
             default: return "Unknown";
         }

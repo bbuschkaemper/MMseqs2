@@ -165,6 +165,8 @@ Parameters::Parameters():
         PARAM_INCLUDE_ONLY_EXTENDABLE(PARAM_INCLUDE_ONLY_EXTENDABLE_ID, "--include-only-extendable", "Include only extendable", "Include only extendable", typeid(bool), (void *) &includeOnlyExtendable, "", MMseqsParameter::COMMAND_CLUSTLINEAR),
         PARAM_IGNORE_MULTI_KMER(PARAM_IGNORE_MULTI_KMER_ID, "--ignore-multi-kmer", "Skip repeating k-mers", "Skip k-mers occurring multiple times (>=2)", typeid(bool), (void *) &ignoreMultiKmer, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_HASH_SHIFT(PARAM_HASH_SHIFT_ID, "--hash-shift", "Shift hash", "Shift k-mer hash initialization", typeid(int), (void *) &hashShift, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_KMER_SELECTION(PARAM_KMER_SELECTION_ID, "--kmer-selection", "K-mer selection", "0: bottom-k minhash, 1: closed syncmers pre-filtered, then bottom-k minhash", typeid(int), (void *) &kmerSelection, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_SYNCMER_S(PARAM_SYNCMER_S_ID, "--syncmer-s", "Syncmer s-mer length", "s-mer length for closed syncmer selection (0 < s < k)", typeid(int), (void *) &syncmerS, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_PICK_N_SIMILAR(PARAM_PICK_N_SIMILAR_ID, "--pick-n-sim-kmer", "Add N similar to search", "Add N similar k-mers to search", typeid(int), (void *) &pickNbest, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ADJUST_KMER_LEN(PARAM_ADJUST_KMER_LEN_ID, "--adjust-kmer-len", "Adjust k-mer length", "Adjust k-mer length based on specificity (only for nucleotides)", typeid(bool), (void *) &adjustKmerLength, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_RESULT_DIRECTION(PARAM_RESULT_DIRECTION_ID, "--result-direction", "Result direction", "result is 0: query, 1: target centric", typeid(int), (void *) &resultDirection, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -176,6 +178,9 @@ Parameters::Parameters():
         PARAM_NUM_ADJACENCY(PARAM_NUM_ADJACENCY_ID, "--num-adjacency", "Number of adjacency based center swapping", "Number of adjacency based center swapping", typeid(int), (void *) &adjIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NEED_WRITEBUFFER(PARAM_NEED_WRITEBUFFER_ID, "--need-write-buffer", "Use write buffer", "Enable or disable allocation of an auxiliary write buffer for intermediate per-thread or per-iteration output and merge steps", typeid(bool), (void *) &needWriteBuffer, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
+        PARAM_COMPRESS_KMER_TMP_FILES(PARAM_COMPRESS_KMER_TMP_FILES_ID, "--compress-kmer-tmp-files", "Compress k-mer temporary files", "Compress kmermatcher temporary files and stream them during merge: 0: off, 1: zstd", typeid(int), (void *) &compressKmerTmpFiles, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_KMER_WRITE_TO_DISK(PARAM_KMER_WRITE_TO_DISK_ID, "--kmer-write-to-disk", "Write k-mers to disk", "Extract k-mers once into per-split files on disk, so each split reads its file instead of re-scanning the sequence DB (identical result; faster when splitting on fast local storage)", typeid(bool), (void *) &kmerWriteToDisk, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_KMERMATCHER_MODE(PARAM_KMERMATCHER_MODE_ID, "--kmermatcher-mode", "K-mer matcher mode", "1: database-key payloads (generic prefilter format), 2: local sequence-index payloads (linclust2/align2clust only)", typeid(int), (void *) &kmerMatcherMode, "^[1-2]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUST_HASH(PARAM_CLUST_HASH_ID, "--clust-hash", "Cluster hash", "Use clusthash before kmermatcher in linclust", typeid(bool), (void *) &clustHash, "^[0-1]{0}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST_VERSION(PARAM_LINCLUST_VERSION_ID, "--linclust-version", "Linclust version", "Linclust version: 1: Linclust1, 2: Linclust2", typeid(int), (void *) &linclustVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUSTER_VERSION(PARAM_CLUSTER_VERSION_ID, "--cluster-version", "Cluster version", "Cluster version: 1: Cluster1, 2: Cluster2", typeid(int), (void *) &clusterVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -1114,6 +1119,8 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_C);
     kmermatcher.push_back(&PARAM_MAX_SEQ_LEN);
     kmermatcher.push_back(&PARAM_HASH_SHIFT);
+    kmermatcher.push_back(&PARAM_KMER_SELECTION);
+    kmermatcher.push_back(&PARAM_SYNCMER_S);
     kmermatcher.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     kmermatcher.push_back(&PARAM_INCLUDE_ONLY_EXTENDABLE);
     kmermatcher.push_back(&PARAM_IGNORE_MULTI_KMER);
@@ -1128,6 +1135,9 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_NUM_ADJACENCY);
     kmermatcher.push_back(&PARAM_USE_PARALLELISM);
     kmermatcher.push_back(&PARAM_NEED_WRITEBUFFER);
+    kmermatcher.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
+    kmermatcher.push_back(&PARAM_KMER_WRITE_TO_DISK);
+    kmermatcher.push_back(&PARAM_KMERMATCHER_MODE);
     kmermatcher.push_back(&PARAM_LINCLUST_VERSION);
 
     // kmermatcher
@@ -1539,6 +1549,8 @@ Parameters::Parameters():
     batchcommon.push_back(&PARAM_THREADS);
     batchcommon.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     batchcommon.push_back(&PARAM_PRELOAD_MODE);
+    batchcommon.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
+    batchcommon.push_back(&PARAM_KMER_WRITE_TO_DISK);
     batchcommon.push_back(&PARAM_V);
 
     // server backends (single-node, multi-node)
@@ -1557,6 +1569,8 @@ Parameters::Parameters():
     linclustbatchinner.push_back(&PARAM_MIN_SEQ_ID);
     linclustbatchinner.push_back(&PARAM_CLUSTER_MODE);
     linclustbatchinner.push_back(&PARAM_KMER_PER_SEQ);
+    linclustbatchinner.push_back(&PARAM_KMER_SELECTION);
+    linclustbatchinner.push_back(&PARAM_SYNCMER_S);
     linclustbatchinner.push_back(&PARAM_INCLUDE_COUNTTABLE);
     linclustbatchinner.push_back(&PARAM_NUM_COUNTS);
     linclustbatchinner.push_back(&PARAM_INCLUDE_ADJACENCY);
@@ -1567,6 +1581,9 @@ Parameters::Parameters():
     linclustbatchinner.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     linclustbatchinner.push_back(&PARAM_PRELOAD_MODE);
     linclustbatchinner.push_back(&PARAM_V);
+    linclustbatchinner.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
+    linclustbatchinner.push_back(&PARAM_KMER_WRITE_TO_DISK);
+    linclustbatchinner.push_back(&PARAM_KMERMATCHER_MODE);
     linclustbatchinner.push_back(&PARAM_CLUST_HASH);
     linclustbatchinner.push_back(&PARAM_LINCLUST_VERSION);
     linclustbatch = combineList(linclustbatchinner, batchserver);
@@ -1578,6 +1595,8 @@ Parameters::Parameters():
     clusterbatchinner.push_back(&PARAM_MIN_SEQ_ID);
     clusterbatchinner.push_back(&PARAM_CLUSTER_MODE);
     clusterbatchinner.push_back(&PARAM_KMER_PER_SEQ);
+    clusterbatchinner.push_back(&PARAM_KMER_SELECTION);
+    clusterbatchinner.push_back(&PARAM_SYNCMER_S);
     clusterbatchinner.push_back(&PARAM_INCLUDE_COUNTTABLE);
     clusterbatchinner.push_back(&PARAM_NUM_COUNTS);
     clusterbatchinner.push_back(&PARAM_INCLUDE_ADJACENCY);
@@ -1588,6 +1607,9 @@ Parameters::Parameters():
     clusterbatchinner.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     clusterbatchinner.push_back(&PARAM_PRELOAD_MODE);
     clusterbatchinner.push_back(&PARAM_V);
+    clusterbatchinner.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
+    clusterbatchinner.push_back(&PARAM_KMER_WRITE_TO_DISK);
+    clusterbatchinner.push_back(&PARAM_KMERMATCHER_MODE);
     clusterbatchinner.push_back(&PARAM_CLUST_HASH);
     clusterbatchinner.push_back(&PARAM_CLUSTER_VERSION);
     clusterbatchinner.push_back(&PARAM_LINCLUST_VERSION);
@@ -2878,6 +2900,8 @@ void Parameters::setDefaults() {
     includeOnlyExtendable = false;
     ignoreMultiKmer = false;
     hashShift = 67;
+    kmerSelection = 0;
+    syncmerS = 6;
     pickNbest = 1;
     adjustKmerLength = false;
     resultDirection = Parameters::PARAM_RESULT_DIRECTION_TARGET;
@@ -2885,6 +2909,9 @@ void Parameters::setDefaults() {
     weightFile = "";
     useParallelism = false;
     needWriteBuffer = false;
+    compressKmerTmpFiles = 0;
+    kmerWriteToDisk = false;
+    kmerMatcherMode = Parameters::KMERMATCHER_MODE_KEY;
     includeCountTable = true;
     countTableScale = 0.1;
     includeAdjacency = true;
