@@ -297,6 +297,7 @@ public:
     static const int SEQUENCE_SPLIT_MODE_HARD = 0;
     static const int SEQUENCE_SPLIT_MODE_SOFT = 1;
     static const int SEQUENCE_SPLIT_MODE_GPU = 2;
+    static const int SEQUENCE_SPLIT_MODE_LENGTH_DESC = 3;
 
     // rescorediagonal
     static const int RESCORE_MODE_HAMMING = 0;
@@ -477,6 +478,7 @@ public:
     // workflow
     std::string runner;
     bool reuseLatest;
+    // former environment-only knobs; they affect results, so they belong on the command line
 
     // CLUSTERING
     int    clusteringMode;
@@ -609,7 +611,9 @@ public:
     int identifierOffset;
     int dbType;
     int createdbMode;
+    int createdbThreads;
     bool shuffleDatabase;
+    int shuffleSplits;
 
     // splitsequence
     int sequenceOverlap;
@@ -1010,7 +1014,9 @@ public:
     PARAMETER(PARAM_ID_OFFSET)  // same
     PARAMETER(PARAM_DB_TYPE)
     PARAMETER(PARAM_CREATEDB_MODE)
+    PARAMETER(PARAM_CREATEDB_THREADS)
     PARAMETER(PARAM_SHUFFLE)
+    PARAMETER(PARAM_SHUFFLE_SPLITS)
     PARAMETER(PARAM_WRITE_LOOKUP)
 
     // convert2fasta
@@ -1241,11 +1247,24 @@ public:
     std::vector<MMseqsParameter*> pickconsensusrepfast;
     std::vector<MMseqsParameter*> gff2db;
     std::vector<MMseqsParameter*> clusthash;
+    std::vector<MMseqsParameter*> clusthashfast;
     std::vector<MMseqsParameter*> kmermatcher;
     std::vector<MMseqsParameter*> kmersearch;
     std::vector<MMseqsParameter*> countkmer;
     std::vector<MMseqsParameter*> easylinclustworkflow;
     std::vector<MMseqsParameter*> linclustworkflow;
+    std::vector<MMseqsParameter*> linclustbatchinner;
+    std::vector<MMseqsParameter*> clusterbatchinner;
+    std::vector<MMseqsParameter*> linclustbatch;
+    std::vector<MMseqsParameter*> linclustbatchaws;
+    std::vector<MMseqsParameter*> linclustbatchall;
+    std::vector<MMseqsParameter*> clusterbatch;
+    std::vector<MMseqsParameter*> clusterbatchaws;
+    std::vector<MMseqsParameter*> clusterbatchall;
+    std::vector<MMseqsParameter*> batchcommon;
+    std::vector<MMseqsParameter*> batchserver;
+    std::vector<MMseqsParameter*> batchaws;
+    std::vector<MMseqsParameter*> batchclustering;
     std::vector<MMseqsParameter*> easysearchworkflow;
     std::vector<MMseqsParameter*> searchworkflow;
     std::vector<MMseqsParameter*> linsearchworkflow;

@@ -11,6 +11,9 @@
 #include <regex.h>
 #include <unistd.h>
 #include <sched.h>
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
 
 #include "blosum62.out.h"
 #include "PAM30.out.h"
@@ -179,6 +182,7 @@ Parameters::Parameters():
         // workflow
         PARAM_RUNNER(PARAM_RUNNER_ID, "--mpi-runner", "MPI runner", "Use MPI on compute cluster with this MPI command (e.g. \"mpirun -np 42\")", typeid(std::string), (void *) &runner, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_REUSELATEST(PARAM_REUSELATEST_ID, "--force-reuse", "Force restart with latest tmp", "Reuse tmp filse in tmp/latest folder ignoring parameters and version changes", typeid(bool), (void *) &reuseLatest, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        // pinned per work area on first use (pin_merge_splits): round TSVs are written pre-split, so one count must cover every round
         // search workflow
         PARAM_NUM_ITERATIONS(PARAM_NUM_ITERATIONS_ID, "--num-iterations", "Search iterations", "Number of iterative profile search iterations", typeid(int), (void *) &numIterations, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_PROFILE),
         PARAM_START_SENS(PARAM_START_SENS_ID, "--start-sens", "Start sensitivity", "Start sensitivity", typeid(float), (void *) &startSens, "^[0-9]*(\\.[0-9]+)?$"),
@@ -216,8 +220,10 @@ Parameters::Parameters():
         PARAM_USE_HEADER(PARAM_USE_HEADER_ID, "--use-fasta-header", "Use fasta header", "Use the id parsed from the fasta header as the index key instead of using incrementing numeric identifiers", typeid(bool), (void *) &useHeader, ""),
         PARAM_ID_OFFSET(PARAM_ID_OFFSET_ID, "--id-offset", "Offset of numeric ids", "Numeric ids in index file are offset by this value", typeid(int), (void *) &identifierOffset, "^(0|[1-9]{1}[0-9]*)$"),
         PARAM_DB_TYPE(PARAM_DB_TYPE_ID, "--dbtype", "Database type", "Database type 0: auto, 1: amino acid 2: nucleotides", typeid(int), (void *) &dbType, "[0-2]{1}"),
-        PARAM_CREATEDB_MODE(PARAM_CREATEDB_MODE_ID, "--createdb-mode", "Createdb mode", "Createdb mode 0: copy data, 1: soft link data and write new index (works only with single line fasta/q) 2: GPU compatible db", typeid(int), (void *) &createdbMode, "^[0-2]{1}$"),
+        PARAM_CREATEDB_MODE(PARAM_CREATEDB_MODE_ID, "--createdb-mode", "Createdb mode", "Createdb mode 0: copy data, 1: soft link data and write new index (works only with single line fasta/q) 2: GPU compatible db, 3: plain db sorted by descending length", typeid(int), (void *) &createdbMode, "^[0-3]{1}$"),
+        PARAM_CREATEDB_THREADS(PARAM_CREATEDB_THREADS_ID, "--createdb-threads", "Createdb file threads", "Input file workers for createdb mode 0. Raise toward the number of independent storage devices. 0: default, never more than --threads", typeid(int), (void *) &createdbThreads, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
         PARAM_SHUFFLE(PARAM_SHUFFLE_ID, "--shuffle", "Shuffle input database", "Shuffle input database", typeid(bool), (void *) &shuffleDatabase, ""),
+        PARAM_SHUFFLE_SPLITS(PARAM_SHUFFLE_SPLITS_ID, "--shuffle-splits", "Shuffle splits", "Number of temporary splits the input is scattered over. Raise it when a single split no longer fits in memory", typeid(int), (void *) &shuffleSplits, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
         PARAM_WRITE_LOOKUP(PARAM_WRITE_LOOKUP_ID, "--write-lookup", "Write lookup file", "write .lookup file containing mapping from internal id, fasta id and file number", typeid(int), (void *) &writeLookup, "^[0-1]{1}", MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_HEADER_FILE(PARAM_USE_HEADER_FILE_ID, "--use-header-file", "Use header DB", "use the sequence header DB instead of the body to map the entry keys", typeid(bool), (void *) &useHeaderFile, ""),
         // setextendeddbtype
@@ -460,8 +466,8 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_INCLUDE_IDENTITY);
     align2clust.push_back(&PARAM_SORT_RESULTS);
     align2clust.push_back(&PARAM_PRELOAD_MODE);
+    align2clust.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     align2clust.push_back(&PARAM_THREADS);
-    align2clust.push_back(&PARAM_COMPRESSED);
     align2clust.push_back(&PARAM_V);
     align2clust.push_back(&PARAM_CLUSTER_MODE);
     align2clust.push_back(&PARAM_FILTER_CLUDB_FILE);
@@ -897,7 +903,9 @@ Parameters::Parameters():
     // create db
     createdb.push_back(&PARAM_DB_TYPE);
     createdb.push_back(&PARAM_SHUFFLE);
+    createdb.push_back(&PARAM_SHUFFLE_SPLITS);
     createdb.push_back(&PARAM_CREATEDB_MODE);
+    createdb.push_back(&PARAM_CREATEDB_THREADS);
     createdb.push_back(&PARAM_WRITE_LOOKUP);
     createdb.push_back(&PARAM_ID_OFFSET);
     createdb.push_back(&PARAM_THREADS);
@@ -922,6 +930,7 @@ Parameters::Parameters():
 
     // convert2fasta
     convert2fasta.push_back(&PARAM_USE_HEADER_FILE);
+    convert2fasta.push_back(&PARAM_THREADS);
     convert2fasta.push_back(&PARAM_V);
 
     // result2flat
@@ -1083,6 +1092,9 @@ Parameters::Parameters():
     clusthash.push_back(&PARAM_THREADS);
     clusthash.push_back(&PARAM_COMPRESSED);
     clusthash.push_back(&PARAM_V);
+
+    clusthashfast = clusthash;
+    clusthashfast.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
 
     // kmermatcher
     kmermatcher.push_back(&PARAM_SUB_MAT);
@@ -1269,6 +1281,7 @@ Parameters::Parameters():
     // createsubdb
     createsubdb.push_back(&PARAM_SUBDB_MODE);
     createsubdb.push_back(&PARAM_ID_MODE);
+    createsubdb.push_back(&PARAM_THREADS);
     createsubdb.push_back(&PARAM_V);
 
     // renamedbkeys
@@ -1519,6 +1532,74 @@ Parameters::Parameters():
     clusterworkflow = combineList(prefilter, align);
     clusterworkflow = combineList(clusterworkflow, rescorediagonal);
     clusterworkflow = combineList(clusterworkflow, clust);
+    // linclust-batch / cluster-batch: infrastructure shared by every backend
+    batchcommon.push_back(&PARAM_CREATEDB_MODE);
+    batchcommon.push_back(&PARAM_SHUFFLE_SPLITS);
+    batchcommon.push_back(&PARAM_REMOVE_TMP_FILES);
+    batchcommon.push_back(&PARAM_THREADS);
+    batchcommon.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    batchcommon.push_back(&PARAM_PRELOAD_MODE);
+    batchcommon.push_back(&PARAM_V);
+
+    // server backends (single-node, multi-node)
+    // per-round binary and tmp reuse are meaningless on AWS: the round binary is the container image, resume rides on S3 done-markers
+    batchserver.push_back(&PARAM_REUSELATEST);
+    batchserver = combineList(batchserver, batchcommon);
+
+    // aws-batch backend
+    batchaws = combineList(batchaws, batchcommon);
+
+    // hidden batch commands keep the union of both backends
+    batchclustering = combineList(batchserver, batchaws);
+
+    linclustbatchinner.push_back(&PARAM_C);
+    linclustbatchinner.push_back(&PARAM_COV_MODE);
+    linclustbatchinner.push_back(&PARAM_MIN_SEQ_ID);
+    linclustbatchinner.push_back(&PARAM_CLUSTER_MODE);
+    linclustbatchinner.push_back(&PARAM_KMER_PER_SEQ);
+    linclustbatchinner.push_back(&PARAM_INCLUDE_COUNTTABLE);
+    linclustbatchinner.push_back(&PARAM_NUM_COUNTS);
+    linclustbatchinner.push_back(&PARAM_INCLUDE_ADJACENCY);
+    linclustbatchinner.push_back(&PARAM_NUM_ADJACENCY);
+    linclustbatchinner.push_back(&PARAM_SWITCH_CONSENSUS_REP);
+    linclustbatchinner.push_back(&PARAM_REMOVE_TMP_FILES);
+    linclustbatchinner.push_back(&PARAM_THREADS);
+    linclustbatchinner.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    linclustbatchinner.push_back(&PARAM_PRELOAD_MODE);
+    linclustbatchinner.push_back(&PARAM_V);
+    linclustbatchinner.push_back(&PARAM_CLUST_HASH);
+    linclustbatchinner.push_back(&PARAM_LINCLUST_VERSION);
+    linclustbatch = combineList(linclustbatchinner, batchserver);
+    linclustbatchaws = combineList(linclustbatchinner, batchaws);
+    linclustbatchall = combineList(linclustbatchinner, batchclustering);
+
+    clusterbatchinner.push_back(&PARAM_C);
+    clusterbatchinner.push_back(&PARAM_COV_MODE);
+    clusterbatchinner.push_back(&PARAM_MIN_SEQ_ID);
+    clusterbatchinner.push_back(&PARAM_CLUSTER_MODE);
+    clusterbatchinner.push_back(&PARAM_KMER_PER_SEQ);
+    clusterbatchinner.push_back(&PARAM_INCLUDE_COUNTTABLE);
+    clusterbatchinner.push_back(&PARAM_NUM_COUNTS);
+    clusterbatchinner.push_back(&PARAM_INCLUDE_ADJACENCY);
+    clusterbatchinner.push_back(&PARAM_NUM_ADJACENCY);
+    clusterbatchinner.push_back(&PARAM_SWITCH_CONSENSUS_REP);
+    clusterbatchinner.push_back(&PARAM_REMOVE_TMP_FILES);
+    clusterbatchinner.push_back(&PARAM_THREADS);
+    clusterbatchinner.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    clusterbatchinner.push_back(&PARAM_PRELOAD_MODE);
+    clusterbatchinner.push_back(&PARAM_V);
+    clusterbatchinner.push_back(&PARAM_CLUST_HASH);
+    clusterbatchinner.push_back(&PARAM_CLUSTER_VERSION);
+    clusterbatchinner.push_back(&PARAM_LINCLUST_VERSION);
+    clusterbatchinner.push_back(&PARAM_CASCADED);
+    clusterbatchinner.push_back(&PARAM_CLUSTER_STEPS);
+    clusterbatchinner.push_back(&PARAM_CLUSTER_REASSIGN);
+    clusterbatchinner.push_back(&PARAM_MAX_SEQS);
+    clusterbatchinner.push_back(&PARAM_S);
+    clusterbatch = combineList(clusterbatchinner, batchserver);
+    clusterbatchaws = combineList(clusterbatchinner, batchaws);
+    clusterbatchall = combineList(clusterbatchinner, batchclustering);
+
     clusterworkflow.push_back(&PARAM_CASCADED);
     clusterworkflow.push_back(&PARAM_CLUSTER_STEPS);
     clusterworkflow.push_back(&PARAM_CLUSTER_REASSIGN);
@@ -1837,6 +1918,18 @@ bool parseBool(const std::string &p) {
     }
 }
 
+size_t parseSizeTParameter(const char *value, const char *name) {
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0' ||
+        parsed > static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
+        Debug(Debug::ERROR) << "Invalid size_t value for " << name << ": " << value << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return static_cast<size_t>(parsed);
+}
+
 void Parameters::initMatrices() {
     // set up substituionMatrix
     for(size_t i = 0 ; i < substitutionMatrices.size(); i++) {
@@ -1933,7 +2026,8 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
                             Debug(Debug::ERROR) << "Error in argument " << par[parIdx]->name << "\n";
                             EXIT(EXIT_FAILURE);
                         }else{
-                            *((size_t *) par[parIdx]->value) = atoi(pargv[argIdx+1]);
+                            *((size_t *) par[parIdx]->value) =
+                                parseSizeTParameter(pargv[argIdx + 1], par[parIdx]->name);
                             par[parIdx]->wasSet = true;
                         }
                         argIdx++;
@@ -2611,7 +2705,9 @@ void Parameters::setDefaults() {
 
     // createdb
     createdbMode = SEQUENCE_SPLIT_MODE_HARD;
+    createdbThreads = 0;
     shuffleDatabase = true;
+    shuffleSplits = 32;
     writeLookup = true;
 
     // format alignment
@@ -2790,10 +2886,8 @@ void Parameters::setDefaults() {
     useParallelism = false;
     needWriteBuffer = false;
     includeCountTable = true;
-    countTableIteration = 2;
     countTableScale = 0.1;
     includeAdjacency = true;
-    adjIteration = 3;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;
     clusterVersion = CLUSTER_VERSION1;
