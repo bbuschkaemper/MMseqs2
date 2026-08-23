@@ -883,18 +883,29 @@ prepare_group() {
 
     local local_manifest="${chunk_manifest}.local"
     local chunk_manifest_tmp="${chunk_manifest}.tmp"
+    # path/bytes/seqs of every input, so a later run can be handed this instead of measuring again
+    local measured_manifest="${chunk_manifest%/*}/input_measured.tsv"
     : > "$local_manifest"
     : > "$chunk_manifest_tmp"
 
     # resolve each input to path/bytes/seqs then bin-pack; --chunk-max-seqs forces a full decompress pass to count
     need_cmd xargs
-    if [[ "${CHUNK_MAX_SEQS:-0}" -gt 0 ]]; then
+    # a three column manifest already carries the counts, so say so instead of promising a full pass
+    local counts_supplied=0
+    # exit inside a rule still runs END, so the verdict has to be decided there
+    if stream_manifest "$input_manifest" | awk 'NF && $0 !~ /^[[:space:]]*#/ { ok = (NF >= 3 && $3 + 0 > 0); exit } END { exit !ok }'; then
+        counts_supplied=1
+    fi
+    if [[ "${CHUNK_MAX_SEQS:-0}" -gt 0 && "$counts_supplied" -eq 0 ]]; then
         log "prepare(group): --chunk-max-seqs=$CHUNK_MAX_SEQS set; counting sequences in every input (one full pass over the data, ${THREADS:-1} at a time)"
+    elif [[ "$counts_supplied" -eq 1 ]]; then
+        log "prepare(group): input manifest carries per-file counts; measuring is skipped"
     fi
     stream_manifest "$input_manifest" \
     | awk -F'\t' 'NF && $0 !~ /^[[:space:]]*#/ { printf "%d\t%s\t%s\t%s%c", ++i, $1, $2 + 0, $3 + 0, 0 }' \
     | xargs -0 -n 1 -P "${THREADS:-1}" env BATCH_WORKER_DISPATCH=1 ZSTD_THREADS=1 bash "$BATCH_SCRIPT" measure-input \
     | sort -k1,1n | cut -f2- \
+    | tee "$measured_manifest" \
     | awk -F'\t' -v dir="$chunk_dir" -v manifest="$local_manifest" \
           -v max_bytes="$CHUNK_MAX_BYTES" -v max_seqs="$CHUNK_MAX_SEQS" '
         function open_chunk() { cid++; flist = sprintf("%s/chunk-%08d.inputs.list", dir, cid); cb = 0; cs = 0; n = 0; counted = 1 }
@@ -918,6 +929,7 @@ prepare_group() {
         END { close_chunk() }
     ' || fail "prepare(group): measuring inputs failed (worker error above); refusing to write a partial chunk manifest"
     [[ -s "$local_manifest" ]] || fail "no input files found in manifest: $input_manifest"
+    log "prepare(group): measured inputs written to $measured_manifest; pass it as the input to skip measuring next time"
 
     # S3 runs need the filelist on S3 too, since worker containers cannot see the driver's local files
     local chunk_id flist uri
