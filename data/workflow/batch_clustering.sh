@@ -836,7 +836,7 @@ measure_input() {
     if [[ -z "${bytes:-}" || "$bytes" == "0" ]]; then
         if [[ "$need_seqs" -eq 1 ]] && ! is_s3 "$path" && [[ -z "$(declared_uncompressed_bytes "$path")" ]]; then
             # no recorded size, so take both numbers from one decompression instead of reading the file twice
-            if ! combined=$(stream_uri "$path" | awk '/^>/ {n++} {b += length($0) + 1} END {printf "%d\t%d\n", b, n + 0}'); then
+            if ! combined=$(stream_uri "$path" | awk '/^>/ {n++} {b += length($0) + 1} END {printf "%.0f\t%.0f\n", b, n + 0}'); then
                 fail_hard "cannot measure '$path': reading or decompressing it failed"
             fi
             IFS=$'\t' read -r bytes seqs <<< "$combined"
@@ -902,7 +902,7 @@ prepare_group() {
             if (n == 0) { return }
             # per-file counts ride along only when every member has one: createdb takes all rows counted, or none
             for (i = 0; i < n; i++) { print (counted ? paths[i] "\t" cnts[i] : paths[i]) > flist }
-            printf "chunk-%08d\t%s\t%d\t%d\n", cid, flist, cs, cb >> manifest; close(manifest); close(flist)
+            printf "chunk-%08d\t%s\t%.0f\t%.0f\n", cid, flist, cs, cb >> manifest; close(manifest); close(flist)
         }
         BEGIN { cid = -1; flist = ""; cb = 0; cs = 0; n = 0 }
         {
@@ -1019,7 +1019,7 @@ prepare() {
                         printf "chunk writer failed while writing %s\n", out > "/dev/stderr"
                         exit 2
                     }
-                    printf "chunk-%08d\t%s\t%d\t%d\n", chunk_id, out, chunk_seqs, chunk_bytes >> chunk_manifest
+                    printf "chunk-%08d\t%s\t%.0f\t%.0f\n", chunk_id, out, chunk_seqs, chunk_bytes >> chunk_manifest
                     close(chunk_manifest)
                 }
                 out = ""
@@ -2041,6 +2041,10 @@ cluster_manifest_single() {
             task_work=$(make_chunk_work_dir "$round_work_dir" "$chunk_id" "$round")
             if ! env BATCH_WORKER_DISPATCH=1 bash "$BATCH_SCRIPT" cluster-chunk "$chunk_uri" "$result_prefix" "$task_work" "$chunk_id" "$round" "${seqs:-0}"; then
                 failed=1
+                # without a retry round the remaining chunks cannot make the result complete
+                if [[ "$MAX_CHUNK_ATTEMPTS" -le 1 ]]; then
+                    fail "chunk ${chunk_id} failed and --max-chunk-attempts is ${MAX_CHUNK_ATTEMPTS}: stopping instead of running the rest for nothing"
+                fi
             fi
         done < "$chunk_manifest"
 
@@ -2177,7 +2181,13 @@ slurm_worker() {
             env BATCH_WORKER_DISPATCH=1 bash "$BATCH_SCRIPT" cluster-chunk "$chunk_uri" "$result_prefix" "$task_work" "$chunk_id" "$round" "${seqs:-0}"
             rc=$?
             set -e
-            [[ "$rc" -eq 0 ]] || log "slurm-worker: chunk ${chunk_id} FAILED (rc=$rc); left no done-marker, so the merge will retry it"
+            if [[ "$rc" -ne 0 ]]; then
+                log "slurm-worker: chunk ${chunk_id} FAILED (rc=$rc); left no done-marker, so the merge will retry it"
+                # without a retry round the remaining chunks cannot make the result complete
+                if [[ "$MAX_CHUNK_ATTEMPTS" -le 1 ]]; then
+                    fail "chunk ${chunk_id} failed and --max-chunk-attempts is ${MAX_CHUNK_ATTEMPTS}: stopping instead of running the rest for nothing"
+                fi
+            fi
         fi
         idx=$((idx + 1))
     done < "$chunk_manifest"
