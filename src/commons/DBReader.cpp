@@ -71,6 +71,11 @@ template <typename T>
 void DBReader<T>::readMmapedDataInMemory(){
     if ((dataMode & USE_DATA) && (dataMode & (USE_FREAD | USE_DIRECT_IO)) == 0) {
         //Debug(Debug::INFO) << "Touch data file " << dataFileName << "\n";
+        // the budget has to cover every file, or a multi file db clears it once per file and touches all of them
+        if (Util::canTouchMemory(totalDataSize) == false) {
+            Debug(Debug::WARNING) << "Can not touch " << totalDataSize << " into main memory\n";
+            return;
+        }
         for(size_t fileIdx = 0; fileIdx < dataFileCnt; fileIdx++){
             size_t dataSize = dataSizeOffset[fileIdx+1]-dataSizeOffset[fileIdx];
             magicBytes += Util::touchMemory(dataFiles[fileIdx], dataSize);

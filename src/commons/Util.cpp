@@ -5,6 +5,7 @@
 #include "SubstitutionMatrix.h"
 #include "Sequence.h"
 #include "Parameters.h"
+#include "MemoryTracker.h"
 #include <sys/resource.h>
 #include "itoa.h"
 
@@ -418,8 +419,15 @@ int Util::madviseLogged(void* addr, size_t len, int advice, const char* context)
 #endif
 }
 
+// the page cache a touch fills competes with what is already allocated, so budget against that
+bool Util::canTouchMemory(size_t size) {
+    const size_t limit = static_cast<size_t>(Util::getTotalSystemMemory() * 0.9);
+    const size_t committed = MemoryTracker::getSize();
+    return size <= ((committed < limit) ? (limit - committed) : 0);
+}
+
 char Util::touchMemory(const char *memory, size_t size) {
-    if(size > Util::getTotalSystemMemory()){
+    if (Util::canTouchMemory(size) == false) {
         Debug(Debug::WARNING) << "Can not touch " << size << " into main memory\n";
         return 0;
     }
