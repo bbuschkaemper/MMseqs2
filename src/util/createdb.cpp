@@ -198,7 +198,8 @@ static void retireRound(int fd, size_t base, size_t bytes, size_t prevBase, size
 // ips4o inlines a functor but not a function pointer, so the direction is a type, not an argument
 template <typename Comp>
 static void sortIndexRange(DBReader<DBKeyType>::Index *index, size_t size, Comp comp) {
-    SORT_PARALLEL(index, index + size, comp);
+    // the parallel sorter drops and duplicates entries here, so this stays serial
+    SORT_SERIAL(index, index + size, comp);
 }
 
 // Sort the data file in-place using your index array
@@ -1742,10 +1743,27 @@ int createdb(int argc, const char **argv, const Command& command) {
                                   << " byte and the sort loads one whole: raise --shuffle-splits above "
                                   << shuffleSplits << "\n";
         }
-        for(unsigned int i = 0; i < shuffleSplits; i++){
-            sortWithIndex(seqWriter.getDataFileNames()[i], seqWriter.getIndexFileNames()[i],
-                          hdrWriter.getDataFileNames()[i], hdrWriter.getIndexFileNames()[i],
-                          par.threads, descendingLength);
+        unsigned int sortGroups = 1;
+        if (maxSplitBytes > 0) {
+            const size_t budget = Util::computeMemory(0) / 2;
+            sortGroups = static_cast<unsigned int>(std::max<size_t>(1, std::min<size_t>(
+                std::min<size_t>(par.threads, shuffleSplits), budget / maxSplitBytes)));
+        }
+        Debug(Debug::INFO) << "Sort runs " << sortGroups << " splits at once\n";
+        // sortGroups 1 must skip the outer region, or the inner parallel sort nests and serializes
+        if (sortGroups > 1) {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(sortGroups)
+            for (unsigned int i = 0; i < shuffleSplits; i++) {
+                sortWithIndex(seqWriter.getDataFileNames()[i], seqWriter.getIndexFileNames()[i],
+                              hdrWriter.getDataFileNames()[i], hdrWriter.getIndexFileNames()[i],
+                              1, descendingLength);
+            }
+        } else {
+            for(unsigned int i = 0; i < shuffleSplits; i++){
+                sortWithIndex(seqWriter.getDataFileNames()[i], seqWriter.getIndexFileNames()[i],
+                              hdrWriter.getDataFileNames()[i], hdrWriter.getIndexFileNames()[i],
+                              par.threads, descendingLength);
+            }
         }
         Debug(Debug::INFO) << "Sort single files in " << timer.lap() << "\n";
         std::string lookupFile = dataFile + ".lookup";
