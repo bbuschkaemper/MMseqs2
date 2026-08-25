@@ -5,6 +5,7 @@
 //
 // Manages DB read access.
 //
+#include <algorithm>
 #include "MemoryTracker.h"
 #include <cstddef>
 #include <utility>
@@ -246,6 +247,15 @@ public:
     char* getDataByDBKey(T key, int thrIdx);
 
     char * getDataByOffset(size_t offset);
+
+    // dataSizeOffset is the running total over the data files, so it is sorted and the owning
+    // file is a binary search. A result db has one data file per writer thread, so the linear
+    // walk this replaces costs up to that many comparisons on every entry read.
+    size_t fileIdxByOffset(size_t offset) const {
+        return static_cast<size_t>(
+            std::upper_bound(dataSizeOffset, dataSizeOffset + dataFileCnt + 1, offset)
+            - dataSizeOffset) - 1;
+    }
 
     size_t getSize() const;
 

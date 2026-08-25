@@ -940,10 +940,7 @@ size_t DBReader<T>::loadBatchDirect(const size_t *ids, size_t n, unsigned int th
         const size_t localId = (local2id != NULL) ? local2id[id] : id;
         const size_t offset = index[localId].offset;
         const size_t length = index[localId].length;
-        size_t file = 0;
-        while ((offset >= dataSizeOffset[file] && offset < dataSizeOffset[file + 1]) == false) {
-            file++;
-        }
+        const size_t file = fileIdxByOffset(offset);
         const size_t fileOffset = offset - dataSizeOffset[file];
         const size_t alignedOffset = fileOffset & ~(directIoAlign - 1);
         const size_t delta = fileOffset - alignedOffset;
@@ -1197,10 +1194,7 @@ template <typename T> char* DBReader<T>::readDirect(size_t offset, size_t length
         Debug(Debug::ERROR) << "Requested offset: " << offset << "\n";
         EXIT(EXIT_FAILURE);
     }
-    size_t cnt = 0;
-    while ((offset >= dataSizeOffset[cnt] && offset < dataSizeOffset[cnt+1]) == false) {
-        cnt++;
-    }
+    size_t cnt = fileIdxByOffset(offset);
     size_t fileOffset = offset - dataSizeOffset[cnt];
     size_t alignedOffset = fileOffset & ~(directIoAlign - 1);
     size_t delta = fileOffset - alignedOffset;
@@ -1431,10 +1425,7 @@ template <typename T> char* DBReader<T>::getDataByOffset(size_t offset) {
         Debug(Debug::ERROR) << "Requested offset: " << offset << "\n";
         EXIT(EXIT_FAILURE);
     }
-    size_t cnt = 0;
-    while ((offset >= dataSizeOffset[cnt] && offset < dataSizeOffset[cnt+1]) == false ) {
-        cnt++;
-    }
+    size_t cnt = fileIdxByOffset(offset);
     size_t fileOffset = offset - dataSizeOffset[cnt];
     return dataFiles[cnt]+fileOffset;
 }
