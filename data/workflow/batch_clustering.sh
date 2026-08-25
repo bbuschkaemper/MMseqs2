@@ -548,7 +548,7 @@ compress_to_zst() {
     local dst="$2"
     need_cmd pzstd
     # pzstd writes a multi-frame .zst so it can later be decompressed in parallel (pzstd -dc).
-    pzstd -p "$THREADS" -3 -c "$src" > "$dst"
+    pzstd -p "$ZSTD_THREADS" -3 -c "$src" > "$dst"
 }
 
 compress_batch_outputs_enabled() {
@@ -1525,6 +1525,10 @@ run_split_jobs() {
     shift 4
     [[ "$jobs" -gt "$splits" ]] && jobs="$splits"
     [[ "$jobs" -lt 1 ]] && jobs=1
+    # each split job runs its own zstd, so THREADS is a budget to divide across the
+    # concurrent jobs, not a figure each of them may claim in full
+    local ZSTD_THREADS=$(( ${THREADS:-1} / jobs ))
+    [[ "$ZSTD_THREADS" -lt 1 ]] && ZSTD_THREADS=1
 
     local pids="" active=0
     local b pid rc=0
@@ -1621,7 +1625,7 @@ merge_emit_shard() {
     mkdir -p "$out_dir"
     if compress_batch_outputs_enabled; then
         need_cmd pzstd
-        cat "${frags[@]}" | pzstd -p "$THREADS" -3 -c > "$tmp"
+        cat "${frags[@]}" | pzstd -p "$ZSTD_THREADS" -3 -c > "$tmp"
     else
         cat "${frags[@]}" > "$tmp"
     fi
