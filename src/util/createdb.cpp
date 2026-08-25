@@ -197,9 +197,13 @@ static void retireRound(int fd, size_t base, size_t bytes, size_t prevBase, size
 
 // ips4o inlines a functor but not a function pointer, so the direction is a type, not an argument
 template <typename Comp>
-static void sortIndexRange(DBReader<DBKeyType>::Index *index, size_t size, Comp comp) {
-    // the parallel sorter drops and duplicates entries here, so this stays serial
-    SORT_SERIAL(index, index + size, comp);
+static void sortIndexRange(DBReader<DBKeyType>::Index *index, size_t size, unsigned int threads, Comp comp) {
+    // callers inside the split parallel region pass 1, where an inner parallel sort only nests
+    if (threads > 1) {
+        SORT_PARALLEL(index, index + size, comp);
+    } else {
+        SORT_SERIAL(index, index + size, comp);
+    }
 }
 
 // Sort the data file in-place using your index array
@@ -237,7 +241,7 @@ int sortWithIndex(const char *dataFileSeq,
         index[i].id = i;
     }
 
-    sortIndexRange(index, reader.getSize(), IndexLengthByKey(headerIndex, descending));
+    sortIndexRange(index, reader.getSize(), threads, IndexLengthByKey(headerIndex, descending));
 
     struct SeqEntry {
         DBReader<DBKeyType>::Index *index;
@@ -279,9 +283,9 @@ int sortWithIndex(const char *dataFileSeq,
     writeSortedParallel(dataFileHeader, header.getSize(), threads, hdrEntry);
     delete [] buf;
 
-    sortIndexRange(index, reader.getSize(), IndexOffset());
+    sortIndexRange(index, reader.getSize(), threads, IndexOffset());
     // the merge pairs the two indexes by position, so both are published in physical order
-    sortIndexRange(headerIndex, header.getSize(), IndexOffset());
+    sortIndexRange(headerIndex, header.getSize(), threads, IndexOffset());
     {
         std::string tmpIndex = std::string(indexFileSeq) + ".tmp";
         FILE *indexout = FileUtil::openFileOrDie(tmpIndex.c_str(), "wb", false);
