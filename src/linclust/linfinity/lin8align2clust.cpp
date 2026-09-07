@@ -425,7 +425,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
     }
     const unsigned int threads = par.threads;
     reader.openBatch(threads, ARENA_BYTES, Util::computeMemory(par.splitMemoryLimit),
-                     RunDbReader::READ_AGAIN);
+                     RunDbReader::READ_SCATTERED, par.lin8ReadCache);
 
     SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, par.scoreBias);
     SubstitutionMatrix::FastMatrix fastMatrix = SubstitutionMatrix::createAsciiSubMat(subMat);

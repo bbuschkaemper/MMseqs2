@@ -2,6 +2,7 @@
 #define MMSEQS_READLINDB_H
 
 #include "Lin8Db.h"
+#include "Lin8ChunkCache.h"
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -76,7 +77,12 @@ public:
 
     static const int READ_ONCE = 0;
     static const int READ_AGAIN = 1;
-    void openBatch(unsigned int threads, size_t arenaBytes, size_t memoryBudget, int revisit = READ_ONCE);
+    // read again in small pieces from anywhere in the file, so the pass depends on those pieces
+    // staying cached between visits. ownCache: 1 the reader keeps them, 0 the kernel does, -1 the
+    // reader does only on a filesystem known not to
+    static const int READ_SCATTERED = 2;
+    void openBatch(unsigned int threads, size_t arenaBytes, size_t memoryBudget, int revisit = READ_ONCE,
+                   int ownCache = -1);
 
     size_t batchRoomFor(uint32_t seqLen) const;
 
@@ -113,10 +119,18 @@ private:
     struct BatchLane {
         std::vector<char> arena;
         char *aligned;
+        size_t used;
         const char *queryAt;
         std::vector<const char *> memberAt;
         IoRing ring;
-        BatchLane() : aligned(NULL), queryAt(NULL) {}
+        // with the own cache: a run of bytes to copy from a chunk into the arena once the batch landed
+        struct Piece {
+            uint32_t slot, from, length;
+            char *to;
+            bool fill;
+        };
+        std::vector<Piece> pieces;
+        BatchLane() : aligned(NULL), used(0), queryAt(NULL) {}
     };
     struct BatchWorker {
         BatchLane lane[LANES];
@@ -124,6 +138,9 @@ private:
     mutable std::vector<BatchWorker *> batch;
 
     bool appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor, const char *&at) const;
+    bool appendDirectRead(BatchLane &lane, int fd, uint64_t offset, size_t length, const char *&at) const;
+    int appendCachedRead(BatchLane &lane, uint32_t file, uint64_t offset, size_t length,
+                         const char *&at) const;
     int directOf(uint32_t file) const;
     const char *fileData(uint32_t file, uint64_t offset) const;
     void mapFile(uint32_t file) const;
@@ -145,6 +162,8 @@ private:
     size_t validCount;
     bool validLoaded;
     mutable bool wantDirect;
+    mutable ChunkCache cache;
+    bool useCache;
 };
 
 class ClusterAssignmentBitmap {

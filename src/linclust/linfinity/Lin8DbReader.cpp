@@ -1,6 +1,7 @@
 #include "Lin8DbReader.h"
 
 #include "Debug.h"
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include "Util.h"
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 
 #if defined(__linux__) && defined(HAVE_LINUX_IO_URING)
 
@@ -313,7 +315,7 @@ const char *RunDbReader::KEPT_BITMAP_SUFFIX = ".clusthash_kept";
 RunDbReader::RunDbReader(const std::string &db, bool withHeaders)
     : db(db), withHeaders(withHeaders), valid(NULL),
       validMap(NULL), validSize(0), validCount(0), validLoaded(false),
-      wantDirect(true) {}
+      wantDirect(true), useCache(false) {}
 
 RunDbReader::~RunDbReader() {
     close();
@@ -385,6 +387,13 @@ void RunDbReader::open() {
 }
 
 void RunDbReader::close() {
+    if (useCache) {
+        Debug(Debug::INFO) << "Chunk cache: " << cache.hits << " hits, " << cache.misses << " misses ("
+                           << ((cache.misses * ChunkCache::CHUNK) >> 30) << " GB read), " << cache.busy
+                           << " reads made on their own\n";
+        cache.close();
+        useCache = false;
+    }
     if (validMap != NULL) {
         munmap(validMap, validSize);
         validMap = NULL;
@@ -547,7 +556,7 @@ static const size_t DIRECT_BLOCK = 512;
 static const unsigned RING_DEPTH = 1024;
 
 void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
-                            size_t memoryBudget, int revisit) {
+                            size_t memoryBudget, int revisit, int ownCache) {
     directFd.assign(data.size(), -1);
     const size_t arenaTotal = (size_t) threads * (arenaBytes + LANES * DIRECT_BLOCK);
     if (arenaTotal >= memoryBudget) {
@@ -558,11 +567,21 @@ void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
     }
     const size_t budget = memoryBudget - arenaTotal;
     const uint64_t sequenceBytes = runs.totalBytes();
-    wantDirect = revisit == READ_ONCE && sequenceBytes > budget / 2;
+    // GPFS serves reads from its own pagepool and keeps nothing in the page cache, so a pass that
+    // reads the same pieces again gets them over the network again; then the reader keeps them
+    struct statfs fs;
+    const bool gpfs = data.empty() == false && statfs((db + ".0").c_str(), &fs) == 0 && fs.f_type == 0x47504653;
+    // a tenth of the budget stays free for the pass's own tables
+    useCache = revisit == READ_SCATTERED && (ownCache == 1 || (ownCache < 0 && gpfs))
+               && cache.open(budget / 10 * 9);
+    // the cache is filled with direct reads, so the kernel does not hold a second copy
+    wantDirect = useCache || (revisit == READ_ONCE && sequenceBytes > budget / 2);
     Debug(Debug::INFO) << "Sequence data: " << (sequenceBytes >> 30) << " GB, budget "
                        << (budget >> 30) << " GB after " << (arenaTotal >> 20)
                        << " MB read arena, reading "
-                       << (wantDirect ? "past the page cache" : "through the page cache") << "\n";
+                       << (useCache ? "into an own cache of " + SSTR((cache.chunkCount() * ChunkCache::CHUNK) >> 30)
+                                          + " GB" + (gpfs ? " (GPFS)" : "")
+                                    : wantDirect ? "past the page cache" : "through the page cache") << "\n";
     const size_t laneBytes = arenaBytes / LANES;
     const size_t longest = 2 * ((size_t) runs.maxSeqLen() + DIRECT_BLOCK);
     if (laneBytes < longest) {
@@ -629,7 +648,17 @@ size_t RunDbReader::batchRoomFor(uint32_t seqLen) const {
 }
 
 void RunDbReader::awaitBatch(unsigned int thread, unsigned int lane) const {
-    batch[thread]->lane[lane].ring.await(db.c_str());
+    BatchLane &at = batch[thread]->lane[lane];
+    at.ring.await(db.c_str());
+    for (size_t i = 0; i < at.pieces.size(); i++) {
+        const BatchLane::Piece &piece = at.pieces[i];
+        if (piece.fill) {
+            cache.filled(piece.slot);
+        }
+        memcpy(piece.to, cache.memoryOf(piece.slot) + piece.from, piece.length);
+        cache.release(piece.slot, false);
+    }
+    at.pieces.clear();
 }
 
 bool RunDbReader::appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor,
@@ -637,19 +666,33 @@ bool RunDbReader::appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor
     cursor.at = runs.runOfFrom(rank, cursor.at);
     const uint64_t offset = runs.offsetIn(cursor.at, rank);
     const size_t length = runs[cursor.at].seqLen();
-    const int fd = directOf(runs[cursor.at].fileIdx());
+    const uint32_t file = runs[cursor.at].fileIdx();
+    if (useCache) {
+        const int took = appendCachedRead(lane, file, offset, length, at);
+        if (took >= 0) {
+            return took == 1;
+        }
+    }
+    return appendDirectRead(lane, directOf(file), offset, length, at);
+}
+
+// the sequence's 512-byte blocks straight into the arena, joined onto the previous read when
+// they follow it in the file
+bool RunDbReader::appendDirectRead(BatchLane &lane, int fd, uint64_t offset, size_t length,
+                                   const char *&at) const {
     const uint64_t blockFrom = offset - offset % DIRECT_BLOCK;
     const uint64_t blockUntil = ((offset + length + DIRECT_BLOCK - 1) / DIRECT_BLOCK) * DIRECT_BLOCK;
 
     const size_t room = lane.arena.size() - DIRECT_BLOCK;
-    size_t used = 0;
+    const size_t used = lane.used;
     std::vector<IoRing::Read> &reads = lane.ring.list();
     if (reads.empty() == false) {
         IoRing::Read &last = reads.back();
         char *into = static_cast<char *>(last.into);
-        used = (size_t) (into - lane.aligned) + last.length;
         const uint64_t end = last.offset + last.length;
-        if (last.fd == fd && last.offset <= blockFrom && blockFrom <= end) {
+        // only a read that ends where the arena ends can grow; a chunk read went elsewhere
+        if (into + last.length == lane.aligned + used && last.fd == fd && last.offset <= blockFrom
+            && blockFrom <= end) {
             const size_t extra = (blockUntil > end) ? (size_t) (blockUntil - end) : 0;
             if (used + extra > room) {
                 return false;
@@ -657,6 +700,7 @@ bool RunDbReader::appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor
             last.length += extra;
             last.required = (size_t) (offset + length - last.offset);
             at = into + (size_t) (offset - last.offset);
+            lane.used += extra;
             return true;
         }
     }
@@ -672,7 +716,61 @@ bool RunDbReader::appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor
     read.required = (size_t) (offset + length - blockFrom);
     reads.push_back(read);
     at = lane.aligned + used + (size_t) (offset - blockFrom);
+    lane.used += span;
     return true;
+}
+
+// 1: the sequence is copied out of the cache once the batch landed; 0: no arena room;
+// -1: a chunk of it is being filled by another thread or has no free slot, read it directly
+int RunDbReader::appendCachedRead(BatchLane &lane, uint32_t file, uint64_t offset, size_t length,
+                                  const char *&at) const {
+    // the arena stays 512-byte aligned for a direct read after this one; +1 is the terminator
+    const size_t need = ((length + 1 + DIRECT_BLOCK - 1) / DIRECT_BLOCK) * DIRECT_BLOCK;
+    if (lane.used + need > lane.arena.size() - DIRECT_BLOCK) {
+        return 0;
+    }
+    char *to = lane.aligned + lane.used;
+    const size_t first = lane.pieces.size();
+    const size_t firstRead = lane.ring.list().size();
+    for (uint64_t pos = offset; pos < offset + length;) {
+        BatchLane::Piece piece;
+        piece.from = static_cast<uint32_t>(pos % ChunkCache::CHUNK);
+        piece.length = static_cast<uint32_t>(std::min<uint64_t>(offset + length - pos, ChunkCache::CHUNK - piece.from));
+        piece.to = to + (pos - offset);
+        ChunkCache::Outcome got = cache.acquire(file, pos / ChunkCache::CHUNK, piece.slot);
+        // a chunk this lane is itself filling has landed by the time it copies; another lane's may not have
+        if (got == ChunkCache::PENDING) {
+            const bool mine = lane.pieces.empty() == false && lane.pieces.back().slot == piece.slot;
+            if (mine == false) {
+                cache.release(piece.slot, false);
+                got = ChunkCache::BUSY;
+            }
+        }
+        if (got == ChunkCache::BUSY) {
+            for (size_t i = first; i < lane.pieces.size(); i++) {
+                cache.release(lane.pieces[i].slot, lane.pieces[i].fill);
+            }
+            lane.pieces.resize(first);
+            lane.ring.list().resize(firstRead);
+            return -1;
+        }
+        piece.fill = got == ChunkCache::MISS;
+        if (piece.fill) {
+            IoRing::Read read;
+            read.into = cache.memoryOf(piece.slot);
+            read.fd = directOf(file);
+            read.offset = pos - piece.from;
+            read.required = (size_t) std::min<uint64_t>(ChunkCache::CHUNK, dataSize[file] - read.offset);
+            read.length = ((read.required + DIRECT_BLOCK - 1) / DIRECT_BLOCK) * DIRECT_BLOCK;
+            lane.ring.list().push_back(read);
+        }
+        lane.pieces.push_back(piece);
+        pos += piece.length;
+    }
+    to[length] = '\0';
+    lane.used += need;
+    at = to;
+    return 1;
 }
 
 size_t RunDbReader::startBatch(uint64_t queryRank, const uint64_t *members, size_t n,
@@ -680,6 +778,8 @@ size_t RunDbReader::startBatch(uint64_t queryRank, const uint64_t *members, size
     BatchLane &at = batch[thread]->lane[lane];
     at.memberAt.clear();
     at.ring.list().clear();
+    at.used = 0;
+    at.pieces.clear();
     Cursor cursor;
     appendBatchRead(at, queryRank, cursor, at.queryAt);
     size_t loaded = 0;

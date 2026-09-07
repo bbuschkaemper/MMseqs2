@@ -1,6 +1,7 @@
 set(linclust_source_files
         linclust/linfinity/Lin8Db.cpp
         linclust/linfinity/Lin8DbReader.cpp
+        linclust/linfinity/Lin8ChunkCache.cpp
         linclust/kmermatcher.cpp
         linclust/kmerindexdb.cpp
         linclust/kmersearch.cpp

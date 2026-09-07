@@ -309,6 +309,7 @@ Parameters::Parameters():
         PARAM_LIN8_REP_RANK_BLOCK_LOOKAHEAD(PARAM_LIN8_REP_RANK_BLOCK_LOOKAHEAD_ID, "--pair-split-lookahead", "Pair splits aligning may run ahead", "How many of the pieces before this one may still be undecided when aligning starts, so aligning overlaps deciding. The skipped pieces only cost the pairs deciding then throws away", typeid(int), (void *) &lin8RepRankBlockLookahead, "^[0-9]+$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LIN8_MONITOR_PID(PARAM_LIN8_MONITOR_PID_ID, "--monitor-pid", "Monitored pid", "Process whose tree lin8-monitor samples; it stops when that process is gone", typeid(int), (void *) &lin8MonitorPid, "^[0-9]+$", MMseqsParameter::COMMAND_MISC),
         PARAM_LIN8_MONITOR_INTERVAL(PARAM_LIN8_MONITOR_INTERVAL_ID, "--monitor-interval", "Monitor interval", "Seconds between resource samples every machine appends to <out>.monitor.<node>.tsv, 0 turns the monitor off", typeid(int), (void *) &lin8MonitorInterval, "^[0-9]+$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_LIN8_READ_CACHE(PARAM_LIN8_READ_CACHE_ID, "--read-cache", "Own read cache", "Keep the sequences the aligning pass reads again in a cache of its own instead of the kernel page cache: 1 always, 0 never, -1 only on a filesystem that does not keep pages (GPFS)", typeid(int), (void *) &lin8ReadCache, "^(-1|0|1)$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_WRITE_LOOKUP(PARAM_WRITE_LOOKUP_ID, "--write-lookup", "Write lookup file", "write .lookup file containing mapping from internal id, fasta id and file number", typeid(int), (void *) &writeLookup, "^[0-1]{1}", MMseqsParameter::COMMAND_EXPERT),
         PARAM_FASTA_SPLITS(PARAM_FASTA_SPLITS_ID, "--fasta-splits", "FASTA splits", "Write this many FASTA files instead of one (entry i to file i mod N). 0: single file", typeid(int), (void *) &fastaSplits, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_HEADER_FILE(PARAM_USE_HEADER_FILE_ID, "--use-header-file", "Use header DB", "use the sequence header DB instead of the body to map the entry keys", typeid(bool), (void *) &useHeaderFile, ""),
@@ -1080,6 +1081,7 @@ Parameters::Parameters():
     lin8align2clust.push_back(&PARAM_LIN8_REP_RANK_BLOCK);
     lin8align2clust.push_back(&PARAM_LIN8_REP_RANK_BLOCK_COUNT);
     lin8align2clust.push_back(&PARAM_LIN8_REP_RANK_BLOCK_LOOKAHEAD);
+    lin8align2clust.push_back(&PARAM_LIN8_READ_CACHE);
     lin8align2clust.push_back(&PARAM_INCLUDE_ALIGN_FILES);
     lin8align2clust.push_back(&PARAM_REMOVE_TMP_FILES);
     lin8align2clust.push_back(&PARAM_V);
@@ -1748,6 +1750,7 @@ Parameters::Parameters():
     linclustoneshotworkflow.push_back(&PARAM_LIN8_REP_RANK_BLOCK_COUNT);
     linclustoneshotworkflow.push_back(&PARAM_LIN8_REP_RANK_BLOCK_LOOKAHEAD);
     linclustoneshotworkflow.push_back(&PARAM_LIN8_MONITOR_INTERVAL);
+    linclustoneshotworkflow.push_back(&PARAM_LIN8_READ_CACHE);
     linclustoneshotworkflow.push_back(&PARAM_MIN_SEQ_ID);
     linclustoneshotworkflow.push_back(&PARAM_C);
     linclustoneshotworkflow.push_back(&PARAM_COV_MODE);
@@ -3110,6 +3113,7 @@ void Parameters::setDefaults() {
     lin8RepRankBlocks = (int) PairRecord::DEFAULT_REP_RANK_BLOCKS;
     lin8MonitorPid = 0;
     lin8MonitorInterval = 5;
+    lin8ReadCache = -1;
     writeLookup = true;
 
     // format alignment

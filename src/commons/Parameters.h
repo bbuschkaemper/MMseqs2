@@ -709,6 +709,7 @@ public:
     int lin8RepRankBlocks;
     int lin8MonitorPid;
     int lin8MonitorInterval;
+    int lin8ReadCache;
 
     // splitsequence
     int sequenceOverlap;
@@ -1200,6 +1201,7 @@ public:
     PARAMETER(PARAM_LIN8_REP_RANK_BLOCK_LOOKAHEAD)
     PARAMETER(PARAM_LIN8_MONITOR_PID)
     PARAMETER(PARAM_LIN8_MONITOR_INTERVAL)
+    PARAMETER(PARAM_LIN8_READ_CACHE)
     PARAMETER(PARAM_WRITE_LOOKUP)
 
     // convert2fasta
