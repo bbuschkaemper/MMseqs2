@@ -26,10 +26,13 @@
 #endif
 
 static const size_t STREAM_ROWS = 1u << 16;
-static const size_t BATCH_ROWS = 1u << 22;
-static const size_t ARENA_BYTES = 64u << 20;
+// the lanes carry slice reads, so a lane arena only has to hold the longest sequence
+static const size_t ARENA_BYTES = 1u << 20;
 
 static const size_t MEMBERS_PER_ALIGN_BATCH = 1024;
+// a batch is read in slices sorted by file position, the next one in flight while this one aligns
+static const size_t READ_SLICES = 8;
+static const size_t SLICE_MIN_ROWS = 1u << 16;
 
 struct MemberBatch {
     size_t group;
@@ -151,10 +154,37 @@ private:
 struct Candidates {
     std::vector<uint64_t> members;
     std::vector<int> diagonals;
+    uint64_t queryRank;
 
+    Candidates() : queryRank(0) {}
     void clear() {
         members.clear();
         diagonals.clear();
+    }
+};
+
+// one thread's rank range of a slice, laid out and read by that thread
+struct SlicePart {
+    std::vector<uint64_t> ranks;
+    std::vector<const char *> at;
+    std::vector<IoRing::Read> reads;
+    size_t bytes;
+};
+
+// the rows of one slice and every sequence they need, read once in file order
+struct ReadSlice {
+    size_t firstItem;
+    size_t lastItem;
+    std::vector<Candidates> items;
+    std::vector<std::vector<uint64_t> > gathered;
+    std::vector<uint64_t> splitters;
+    std::vector<SlicePart> parts;
+    std::vector<size_t> partOffset;
+    std::vector<char> arena;
+
+    const char *sequenceOf(uint64_t rank) const {
+        const SlicePart &part = parts[std::upper_bound(splitters.begin(), splitters.end(), rank) - splitters.begin()];
+        return part.at[std::lower_bound(part.ranks.begin(), part.ranks.end(), rank) - part.ranks.begin()];
     }
 };
 
@@ -173,20 +203,18 @@ struct AlignWorker {
     BlockAligner aligner;
 };
 
-static size_t draw(size_t &counter) {
-    size_t mine = 0;
-#pragma omp atomic capture
-    mine = counter++;
-    return mine;
-}
-
 struct GateCounts {
-    GateCounts() : seen(0), rejected(0), rescued(0), kept(0), stale(0) {}
+    GateCounts() : seen(0), rejected(0), rescued(0), kept(0), stale(0),
+                   selfRow(0), targetSkip(0), covSkip(0), querySkip(0) {}
     uint64_t seen;
     uint64_t rejected;
     uint64_t rescued;
     uint64_t kept;
     uint64_t stale;
+    uint64_t selfRow;
+    uint64_t targetSkip;
+    uint64_t covSkip;
+    uint64_t querySkip;
 };
 
 static float lookupScorePerColumn(const std::string &table, double seqId, double cov,
@@ -302,104 +330,147 @@ static bool rescueWithGaps(uint64_t member, uint32_t queryLen, uint32_t targetLe
     return true;
 }
 
-static size_t startMemberBatch(const RunDbReader &reader, uint64_t rep, const PairRecord *rows,
-                               size_t count, const ClusterAssignmentBitmap &assignedCluster, const Parameters &par,
-                               unsigned int thread, unsigned int lane, Candidates &candidates) {
+static void collectCandidates(const Lin8DbReader &reader, uint64_t rep, const PairRecord *rows, size_t count,
+                              const ClusterAssignmentBitmap &assignedCluster, const Parameters &par,
+                              Candidates &candidates, GateCounts &gate) {
     candidates.clear();
+    candidates.queryRank = rep;
     if (assignedCluster.isAssigned(rep)) {
-        return 0;
+        return;
     }
     const uint32_t queryLen = reader.getSeqLen(rep);
     for (size_t i = 0; i < count; i++) {
         const uint64_t member = rows[i].member();
-        if (member == rep || assignedCluster.isAssigned(member)) {
+        if (member == rep) {
+            gate.selfRow++;
+            continue;
+        }
+        if (assignedCluster.isAssigned(member)) {
+            gate.targetSkip++;
             continue;
         }
         if (Util::canBeCovered(par.covThr, par.covMode, queryLen, reader.getSeqLen(member)) == false) {
+            gate.covSkip++;
             continue;
         }
         candidates.members.push_back(member);
         candidates.diagonals.push_back(rows[i].diagonal());
     }
-    if (candidates.members.empty()) {
-        return 0;
-    }
-    return reader.startBatch(rep, candidates.members.data(), candidates.members.size(), thread, lane);
 }
 
-static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, size_t got,
-                       const ClusterAssignmentBitmap &assignedCluster, Sequence &query, Sequence &target,
-                       BlockAligner &aligner, const Parameters &par, unsigned int thread,
-                       unsigned int lane, Candidates &candidates,
-                       std::vector<uint64_t> &out, GateCounts &gate, float scorePerColThreshold,
-                       int xDrop, std::vector<std::string> *lines) {
+// each thread sorts the ranks of every threads-th item, and thread 0 picks the range splitters from its share
+static void gatherRanks(ReadSlice &slice, unsigned int thread, unsigned int threads) {
+    std::vector<uint64_t> &ranks = slice.gathered[thread];
+    ranks.clear();
+    for (size_t k = thread; k < slice.items.size(); k += threads) {
+        const Candidates &item = slice.items[k];
+        if (item.members.empty()) {
+            continue;
+        }
+        ranks.push_back(item.queryRank);
+        ranks.insert(ranks.end(), item.members.begin(), item.members.end());
+    }
+    SORT_SERIAL(ranks.begin(), ranks.end());
+    ranks.erase(std::unique(ranks.begin(), ranks.end()), ranks.end());
+    if (thread == 0) {
+        slice.splitters.resize(threads - 1);
+        for (unsigned int t = 0; t + 1 < threads; t++) {
+            slice.splitters[t] = ranks.empty() ? 0 : ranks[ranks.size() * (t + 1) / threads];
+        }
+    }
+}
+
+// merges this thread's rank range out of every gathered list and measures its reads
+static void measurePart(const Lin8DbReader &reader, ReadSlice &slice, unsigned int thread) {
+    SlicePart &part = slice.parts[thread];
+    part.ranks.clear();
+    for (size_t g = 0; g < slice.gathered.size(); g++) {
+        const std::vector<uint64_t> &ranks = slice.gathered[g];
+        std::vector<uint64_t>::const_iterator from = thread == 0 ? ranks.begin()
+            : std::lower_bound(ranks.begin(), ranks.end(), slice.splitters[thread - 1]);
+        std::vector<uint64_t>::const_iterator until = thread == slice.parts.size() - 1 ? ranks.end()
+            : std::lower_bound(from, ranks.end(), slice.splitters[thread]);
+        part.ranks.insert(part.ranks.end(), from, until);
+    }
+    SORT_SERIAL(part.ranks.begin(), part.ranks.end());
+    part.ranks.erase(std::unique(part.ranks.begin(), part.ranks.end()), part.ranks.end());
+    part.bytes = reader.layoutReads(part.ranks.data(), part.ranks.size(), NULL, part.reads, part.at);
+}
+
+static void placeParts(ReadSlice &slice) {
+    slice.partOffset.resize(slice.parts.size() + 1);
+    slice.partOffset[0] = 0;
+    for (size_t t = 0; t < slice.parts.size(); t++) {
+        slice.partOffset[t + 1] = slice.partOffset[t] + slice.parts[t].bytes;
+    }
+    if (slice.arena.size() < slice.partOffset.back()) {
+        slice.arena.resize(slice.partOffset.back());
+    }
+}
+
+static void alignMemberBatch(const Lin8DbReader &reader, uint64_t rep,
+                             const ClusterAssignmentBitmap &assignedCluster, Sequence &query, Sequence &target,
+                             BlockAligner &aligner, const Parameters &par, const Candidates &candidates,
+                             const ReadSlice &slice, std::vector<uint64_t> &out, GateCounts &gate, float scorePerColThreshold,
+                             int xDrop, std::vector<std::string> *lines) {
     const uint32_t queryLen = reader.getSeqLen(rep);
     std::string line;
-    size_t from = 0;
-    while (from < candidates.members.size()) {
-        reader.awaitBatch(thread, lane);
-        const char *querySeq = reader.batchQueryAt(thread, lane);
-        query.mapSequence(0, 0, (char *) querySeq, queryLen);
-        aligner.initQuery(&query);
-        for (size_t k = 0; k < got; k++) {
-            const uint64_t member = candidates.members[from + k];
-            if (assignedCluster.isAssigned(member)) {
-                gate.stale++;
-                continue;
-            }
-            const uint32_t targetLen = reader.getSeqLen(member);
-            const char *targetSeq = reader.batchAt(thread, lane, k);
-            target.mapSequence(0, 0, (char *) targetSeq, targetLen);
-            const BlockAligner::UngappedAln_res hit = aligner.ungappedAlign(
-                &target, static_cast<unsigned short>(candidates.diagonals[from + k]));
-            gate.seen++;
-            if (hit.eval > par.evalThr || hit.alnLen < par.alnLenThr
-                || Util::hasCoverage(par.covThr, par.covMode, hit.qcov, hit.tcov) == false) {
-                gate.rejected++;
-                if (rescueWithGaps(member, queryLen, targetLen, querySeq, targetSeq, hit, assignedCluster,
-                                   target, aligner, par, scorePerColThreshold, xDrop, gate,
-                                   lines == NULL ? NULL : &line)) {
-                    out.push_back(member);
-                    if (lines != NULL) {
-                        lines->push_back(line);
-                    }
-                }
-                continue;
-            }
-            int identical = 0;
-            for (int q = hit.qStart; q <= hit.qEnd; q++) {
-                const char a = querySeq[q] & static_cast<unsigned char>(~0x20);
-                const char b =
-                    targetSeq[hit.tStart + (q - hit.qStart)] & static_cast<unsigned char>(~0x20);
-                identical += (a == b);
-            }
-            const float seqId =
-                Util::computeSeqId(par.seqIdMode, identical, queryLen, targetLen, hit.alnLen);
-            if (seqId < par.seqIdThr - FLT_EPSILON) {
-                gate.rejected++;
-                if (rescueWithGaps(member, queryLen, targetLen, querySeq, targetSeq, hit, assignedCluster,
-                                   target, aligner, par, scorePerColThreshold, xDrop, gate,
-                                   lines == NULL ? NULL : &line)) {
-                    out.push_back(member);
-                    if (lines != NULL) {
-                        lines->push_back(line);
-                    }
-                }
-                continue;
-            }
-            out.push_back(member);
-            if (lines != NULL) {
-                line.clear();
-                appendAlnTextLine(line, member, hit.bitScore, seqId, hit.eval, hit.qStart, hit.qEnd,
-                                  queryLen, hit.tStart, hit.tEnd, targetLen,
-                                  SSTR(hit.qEnd - hit.qStart + 1) + "M");
-                lines->push_back(line);
-            }
+    const char *querySeq = slice.sequenceOf(rep);
+    query.mapSequence(0, 0, (char *) querySeq, queryLen);
+    aligner.initQuery(&query);
+    for (size_t k = 0; k < candidates.members.size(); k++) {
+        const uint64_t member = candidates.members[k];
+        if (assignedCluster.isAssigned(member)) {
+            gate.stale++;
+            continue;
         }
-        from += got;
-        if (from < candidates.members.size()) {
-            got = reader.startBatch(rep, candidates.members.data() + from,
-                                    candidates.members.size() - from, thread, lane);
+        const uint32_t targetLen = reader.getSeqLen(member);
+        const char *targetSeq = slice.sequenceOf(member);
+        target.mapSequence(0, 0, (char *) targetSeq, targetLen);
+        const BlockAligner::UngappedAln_res hit = aligner.ungappedAlign(
+            &target, static_cast<unsigned short>(candidates.diagonals[k]));
+        gate.seen++;
+        if (hit.eval > par.evalThr || hit.alnLen < par.alnLenThr
+            || Util::hasCoverage(par.covThr, par.covMode, hit.qcov, hit.tcov) == false) {
+            gate.rejected++;
+            if (rescueWithGaps(member, queryLen, targetLen, querySeq, targetSeq, hit, assignedCluster,
+                               target, aligner, par, scorePerColThreshold, xDrop, gate,
+                               lines == NULL ? NULL : &line)) {
+                out.push_back(member);
+                if (lines != NULL) {
+                    lines->push_back(line);
+                }
+            }
+            continue;
+        }
+        int identical = 0;
+        for (int q = hit.qStart; q <= hit.qEnd; q++) {
+            const char a = querySeq[q] & static_cast<unsigned char>(~0x20);
+            const char b =
+                targetSeq[hit.tStart + (q - hit.qStart)] & static_cast<unsigned char>(~0x20);
+            identical += (a == b);
+        }
+        const float seqId =
+            Util::computeSeqId(par.seqIdMode, identical, queryLen, targetLen, hit.alnLen);
+        if (seqId < par.seqIdThr - FLT_EPSILON) {
+            gate.rejected++;
+            if (rescueWithGaps(member, queryLen, targetLen, querySeq, targetSeq, hit, assignedCluster,
+                               target, aligner, par, scorePerColThreshold, xDrop, gate,
+                               lines == NULL ? NULL : &line)) {
+                out.push_back(member);
+                if (lines != NULL) {
+                    lines->push_back(line);
+                }
+            }
+            continue;
+        }
+        out.push_back(member);
+        if (lines != NULL) {
+            line.clear();
+            appendAlnTextLine(line, member, hit.bitScore, seqId, hit.eval, hit.qStart, hit.qEnd,
+                              queryLen, hit.tStart, hit.tEnd, targetLen,
+                              SSTR(hit.qEnd - hit.qStart + 1) + "M");
+            lines->push_back(line);
         }
     }
 }
@@ -416,7 +487,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
     readPipelineShape(par.db2, writerNodes, repRankBlocks, ranks);
     requireEveryNodeDone(par.db2, writerNodes);
 
-    RunDbReader reader(par.db1);
+    Lin8DbReader reader(par.db1);
     reader.open();
     if (reader.getSize() != ranks) {
         Debug(Debug::ERROR) << "The database holds " << reader.getSize()
@@ -424,13 +495,16 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
         EXIT(EXIT_FAILURE);
     }
     const unsigned int threads = par.threads;
+    // a batch fills every lane four times over, so the fork and join are lost in the aligning
+    const size_t batchRows = (size_t) threads * Lin8DbReader::LANES * MEMBERS_PER_ALIGN_BATCH * 4;
+    Debug(Debug::INFO) << "Batches of " << batchRows << " rows\n";
     reader.openBatch(threads, ARENA_BYTES, Util::computeMemory(par.splitMemoryLimit),
-                     RunDbReader::READ_SCATTERED, par.lin8ReadCache);
+                     Lin8DbReader::READ_AGAIN, Lin8DbReader::ACCESS_RANDOM);
 
     SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, par.scoreBias);
     SubstitutionMatrix::FastMatrix fastMatrix = SubstitutionMatrix::createAsciiSubMat(subMat);
-    EvalueComputation evaluer(reader.getTotalBytes(), &subMat);
-    const size_t maxLen = std::max<size_t>(reader.getSequenceLocator().maxSeqLen(), 1);
+    EvalueComputation evaluer(reader.getDataSize(), &subMat);
+    const size_t maxLen = std::max<size_t>(reader.getIndex().getMaxSeqLen(), 1);
 
     size_t firstRepRankBlock = par.lin8RepRankBlock < 0 ? 0 : (size_t) par.lin8RepRankBlock;
     const size_t lastRepRankBlock =
@@ -447,11 +521,12 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
             firstRepRankBlock++;
         }
         if (firstRepRankBlock > 0) {
-            Debug(Debug::INFO) << "Resuming at repRankBlock " << firstRepRankBlock << "\n";
+            Debug(Debug::INFO) << "Resuming at rank block " << firstRepRankBlock << "\n";
         }
     }
-    Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes "
-                       << (lastRepRankBlock - firstRepRankBlock) << " of " << repRankBlocks << " repRankBlocks\n";
+    Debug(Debug::INFO) << node.says("takes")
+                       << node.share(lastRepRankBlock - firstRepRankBlock, repRankBlocks)
+                       << " rank blocks\n";
 
     ClusterAssignmentBitmap assignedCluster;
     assignedCluster.open(par.db4 + ".align_assigned_" + SSTR(node.index), ranks);
@@ -463,10 +538,11 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
         assignedCluster.catchUpToAvailable(par.db4, firstRepRankBlock, floor);
         assignedCluster.save(0);
     }
-    const BucketCounts prefCounts(par.db2, writerNodes, PairRecord::REP_RANK_SUB_BLOCKS, repRankBlocks);
+    const SubBucketCounts prefCounts(par.db2, writerNodes, PairRecord::REP_RANK_SUB_BLOCKS, repRankBlocks);
 
     Timer timer;
     uint64_t aligned = 0;
+    uint64_t querySkipped = 0;
     uint64_t passed = 0;
     std::vector<PairRecord> batch;
     std::vector<size_t> starts;
@@ -479,10 +555,14 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
     std::vector<std::vector<std::string> > batchSurvivorLines;
     std::string text;
     double spentReading = 0, spentAligning = 0, spentDeciding = 0, spentWriting = 0;
+    uint64_t wastedPasses = 0;
     double aligningThreadSeconds = 0;
     Debug::Progress progress(repRankBlocks);
-    std::vector<std::vector<Candidates> > candidates(threads,
-                                                     std::vector<Candidates>(RunDbReader::LANES));
+    ReadSlice slices[2];
+    for (int i = 0; i < 2; i++) {
+        slices[i].gathered.resize(threads);
+        slices[i].parts.resize(threads);
+    }
     std::vector<PairRecord> outBuffer;
     std::vector<AlignWorker *> workers(threads, NULL);
     std::vector<GateCounts> gate(threads);
@@ -514,12 +594,12 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
         for (size_t sub = 0; sub < subRows.size(); sub++) {
             blockRows += subRows[sub];
         }
-        // cut the block where the rows are, not where the ranks are: the front of a block holds the
-        // longer sequences, so equal rank spans hand the first machine the heavier half
+        // cut the block where the rows are, not where the ranks are, and weigh the first node by --first-node-share
         size_t subFrom = 0, subUntil = 0;
         uint64_t skipRows = 0, seenRows = 0;
         for (size_t sub = 0, at = 0; at <= node.count; ) {
-            const uint64_t want = blockRows * at / node.count;
+            const double before = at == 0 ? 0.0 : par.lin8FirstNodeShare + (at - 1);
+            const uint64_t want = (uint64_t) (blockRows * before / (par.lin8FirstNodeShare + (node.count - 1)));
             if (seenRows >= want) {
                 if (at == node.index) { subFrom = sub; skipRows = seenRows; }
                 if (at == node.index + 1) { subUntil = sub; }
@@ -556,7 +636,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                 assignedCluster.catchUpToAvailable(par.db4, repRankBlock,
                                                    repRankBlock > lookahead ? repRankBlock - lookahead : 0);
             }
-            const bool more = stream.fillBatch(batch, BATCH_ROWS, myUntil);
+            const bool more = stream.fillBatch(batch, batchRows, myUntil);
             spentReading += omp_get_wtime() - mark;
             if (more == false) {
                 break;
@@ -586,7 +666,11 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                     survivorLines[g].clear();
                 }
                 const uint64_t rep = batch[starts[g]].rep();
-                if (rep < myFrom || rep >= myUntil || assignedCluster.isAssigned(rep)) {
+                if (rep < myFrom || rep >= myUntil) {
+                    continue;
+                }
+                if (assignedCluster.isAssigned(rep)) {
+                    querySkipped += starts[g + 1] - starts[g];
                     continue;
                 }
                 const size_t rows = starts[g + 1] - starts[g];
@@ -607,7 +691,9 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
             }
 
             mark = omp_get_wtime();
-            size_t drawn = 0;
+            const size_t slicesWanted = std::max<size_t>(1, std::min(READ_SLICES, batch.size() / SLICE_MIN_ROWS));
+            const size_t sliceItems = (work.size() + slicesWanted - 1) / slicesWanted;
+            const size_t sliceCount = sliceItems == 0 ? 0 : (work.size() + sliceItems - 1) / sliceItems;
 #pragma omp parallel num_threads(threads)
             {
                 unsigned int thread = 0;
@@ -618,46 +704,61 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                     workers[thread] = new AlignWorker(maxLen, subMat, fastMatrix, evaluer, par);
                 }
                 AlignWorker &worker = *workers[thread];
-                const double began = omp_get_wtime();
-                unsigned int lane = 0;
-                size_t here = draw(drawn);
-                size_t got = 0;
-                if (here < work.size()) {
-                    const MemberBatch &item = work[here];
-                    const size_t at = starts[item.group];
-                    got = startMemberBatch(reader, batch[at].rep(), &batch[at + item.from],
-                                           item.count, assignedCluster, par, thread, lane,
-                                           candidates[thread][lane]);
-                }
-                while (here < work.size()) {
-                    const size_t next = draw(drawn);
-                    const unsigned int nextLane = lane ^ 1u;
-                    size_t nextGot = 0;
-                    if (next < work.size()) {
-                        const MemberBatch &item = work[next];
-                        const size_t at = starts[item.group];
-                        nextGot = startMemberBatch(reader, batch[at].rep(), &batch[at + item.from],
-                                                   item.count, assignedCluster, par, thread, nextLane,
-                                                   candidates[thread][nextLane]);
+                double aligning = 0;
+                for (size_t s = 0; s <= sliceCount; s++) {
+                    const double began = omp_get_wtime();
+                    double waited = 0;
+                    if (s < sliceCount) {
+                        ReadSlice &slice = slices[s % 2];
+#pragma omp single
+                        {
+                            slice.firstItem = s * sliceItems;
+                            slice.lastItem = std::min(work.size(), slice.firstItem + sliceItems);
+                            slice.items.resize(slice.lastItem - slice.firstItem);
+                        }
+#pragma omp for schedule(dynamic, 16)
+                        for (size_t w = slice.firstItem; w < slice.lastItem; w++) {
+                            const MemberBatch &item = work[w];
+                            const size_t at = starts[item.group];
+                            collectCandidates(reader, batch[at].rep(), &batch[at + item.from], item.count,
+                                              assignedCluster, par, slice.items[w - slice.firstItem], gate[thread]);
+                        }
+                        gatherRanks(slice, thread, threads);
+#pragma omp barrier
+                        measurePart(reader, slice, thread);
+#pragma omp barrier
+#pragma omp single
+                        placeParts(slice);
+                        SlicePart &part = slice.parts[thread];
+                        reader.layoutReads(part.ranks.data(), part.ranks.size(),
+                                           slice.arena.data() + slice.partOffset[thread], part.reads, part.at);
+                        reader.submitReads(thread, s % 2, part.reads.data(), part.reads.size());
                     }
-                    const MemberBatch &item = work[here];
-                    const size_t at = starts[item.group];
-                    batchSurvivors[here].clear();
-                    if (wantText) {
-                        batchSurvivorLines[here].clear();
+                    if (s > 0) {
+                        ReadSlice &slice = slices[(s - 1) % 2];
+                        const double stalled = omp_get_wtime();
+                        reader.awaitBatch(thread, (s - 1) % 2);
+#pragma omp barrier
+                        waited = omp_get_wtime() - stalled;
+#pragma omp for schedule(dynamic, 1)
+                        for (size_t w = slice.firstItem; w < slice.lastItem; w++) {
+                            const Candidates &item = slice.items[w - slice.firstItem];
+                            batchSurvivors[w].clear();
+                            if (wantText) {
+                                batchSurvivorLines[w].clear();
+                            }
+                            if (item.members.empty()) {
+                                continue;
+                            }
+                            alignMemberBatch(reader, item.queryRank, assignedCluster, worker.query, worker.target,
+                                             worker.aligner, par, item, slice, batchSurvivors[w], gate[thread],
+                                             scorePerColThreshold, xDrop, wantText ? &batchSurvivorLines[w] : NULL);
+                        }
                     }
-                    alignMemberBatch(reader, batch[at].rep(), got, assignedCluster, worker.query,
-                                     worker.target, worker.aligner, par, thread, lane,
-                                     candidates[thread][lane], batchSurvivors[here],
-                                     gate[thread], scorePerColThreshold, xDrop,
-                                     wantText ? &batchSurvivorLines[here] : NULL);
-                    here = next;
-                    lane = nextLane;
-                    got = nextGot;
+                    aligning += omp_get_wtime() - began - waited;
                 }
-                const double mine = omp_get_wtime() - began;
 #pragma omp atomic
-                aligningThreadSeconds += mine;
+                aligningThreadSeconds += aligning;
             }
 #pragma omp parallel for schedule(dynamic, 64) num_threads(threads)
             for (size_t g = 0; g < groups; g++) {
@@ -681,6 +782,13 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                 aligned += starts[g + 1] - starts[g];
                 passed += survivors[g].size();
                 if (decideHere) {
+                    if (assignedCluster.isAssigned(rep)) {
+                        wastedPasses += survivors[g].size();
+                    } else {
+                        for (size_t k = 0; k < survivors[g].size(); k++) {
+                            wastedPasses += survivors[g][k] != rep && assignedCluster.isAssigned(survivors[g][k]);
+                        }
+                    }
                     const size_t before = outBuffer.size();
                     const bool made = assignCluster(rep, survivors[g].data(), survivors[g].size(),
                                                     assignedCluster, outBuffer, assigned);
@@ -755,7 +863,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                 || repRankBlock + 1 == lastRepRankBlock) {
                 publishAllAtomically(pendingOut, threads);
                 if (par.removeTmpFiles) {
-                    dropConsumed(par.db2, writerNodes, pendingFirst, repRankBlock + 1, 1);
+                    removeConsumedBuckets(par.db2, writerNodes, pendingFirst, repRankBlock + 1, 1);
                 }
                 pendingFirst = repRankBlock + 1;
                 pendingBytes = 0;
@@ -796,7 +904,18 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
     Debug(Debug::INFO) << "Ungapped filter: " << all.seen << " pairs, "
                        << (all.seen - all.rejected + all.kept) << " accepted; " << all.rescued
                        << " of the failures retried with gaps and " << all.kept << " passed\n";
-    Debug(Debug::INFO) << "Dropped " << all.stale << " reads a decided block had already clustered\n";
+    all.selfRow = 0; all.targetSkip = 0; all.covSkip = 0; all.querySkip = 0;
+    for (int i = 0; i < par.threads; i++) {
+        all.selfRow += gate[i].selfRow; all.targetSkip += gate[i].targetSkip;
+        all.covSkip += gate[i].covSkip; all.querySkip += gate[i].querySkip;
+    }
+    all.querySkip = querySkipped;
+    Debug(Debug::INFO) << "Before aligning: " << all.querySkip << " rows whose representative was already clustered, "
+                       << all.targetSkip << " members already clustered, " << all.selfRow
+                       << " self rows, " << all.covSkip << " that no alignment could cover\n";
+    if (all.stale > 0) {
+        Debug(Debug::INFO) << "Raced with another node on " << all.stale << " candidate pairs it clustered first\n";
+    }
     Debug(Debug::INFO) << "Time for reading: " << (uint64_t) spentReading << "s aligning: "
                        << (uint64_t) spentAligning << "s deciding: " << (uint64_t) spentDeciding
                        << "s writing: " << (uint64_t) spentWriting << "s\n";
@@ -805,11 +924,12 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                        << " of " << threads << " threads on average, "
                        << (uint64_t) (spentAligning * threads - aligningThreadSeconds)
                        << " thread seconds idle\n";
-    Debug(Debug::INFO) << "Aligned " << aligned << " candidates, " << passed << " passed, in "
+    Debug(Debug::INFO) << "Read " << aligned << " candidate rows, " << passed << " passed, in "
                        << timer.lap() << "\n";
     if (decideHere) {
         Debug(Debug::INFO) << "Made " << clusters << " clusters holding " << (clusters + assigned)
                            << " sequences\n";
+        Debug(Debug::INFO) << wastedPasses << " passed alignments were for members another group in the same batch had already taken\n";
     }
     for (size_t i = 0; i < workers.size(); i++) {
         delete workers[i];

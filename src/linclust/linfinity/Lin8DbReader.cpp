@@ -13,7 +13,7 @@
 #include "Util.h"
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/vfs.h>
+#include <zstd.h>
 
 #if defined(__linux__) && defined(HAVE_LINUX_IO_URING)
 
@@ -265,7 +265,8 @@ void IoRing::await(const char *what) {
 #endif
 }
 
-const uint64_t RunDbReader::VALID_MAGIC = 0x4C494E4356414C44ull;
+const uint64_t Lin8DbReader::KEPT_BITMAP_MAGIC = 0x4C494E4356414C44ull;
+const uint64_t Lin8DbReader::HEADER_FRAMES_MAGIC = 0x4C494E3848445246ull;
 
 namespace {
 size_t fileSizeIfExists(const std::string &path, bool &exists) {
@@ -310,26 +311,26 @@ char *mapFileReadOnly(const std::string &path, size_t length, int &keptFd) {
 }
 }
 
-const char *RunDbReader::KEPT_BITMAP_SUFFIX = ".clusthash_kept";
+const char *Lin8DbReader::KEPT_BITMAP_SUFFIX = ".clusthash_kept";
 
-RunDbReader::RunDbReader(const std::string &db, bool withHeaders)
-    : db(db), withHeaders(withHeaders), valid(NULL),
-      validMap(NULL), validSize(0), validCount(0), validLoaded(false),
-      wantDirect(true), useCache(false) {}
+Lin8DbReader::Lin8DbReader(const std::string &db, bool withHeaders)
+    : db(db), withHeaders(withHeaders), kept(NULL),
+      keptMap(NULL), keptSize(0), keptCount(0), keptLoaded(false),
+      wantDirect(true), batchAccess(ACCESS_UNHINTED) {}
 
-RunDbReader::~RunDbReader() {
+Lin8DbReader::~Lin8DbReader() {
     close();
 }
 
-void RunDbReader::open() {
-    runs.read(db + ".runs");
-    runs.checkLengthsDescend();
-    for (unsigned int i = 0; i < runs.fileCount(); i++) {
+void Lin8DbReader::open() {
+    index.read(db + ".ranges");
+    index.checkLengthsDescend();
+    for (unsigned int i = 0; i < index.fileCount(); i++) {
         bool exists = false;
         const size_t length = fileSizeIfExists(db + "." + SSTR(i), exists);
         if (exists == false) {
-            Debug(Debug::ERROR) << "Data file " << (db + "." + SSTR(i)) << " is missing, the run "
-                                << "table declares " << runs.fileCount() << " of them\n";
+            Debug(Debug::ERROR) << "Data file " << (db + "." + SSTR(i)) << " is missing, the range "
+                                << "table declares " << index.fileCount() << " of them\n";
             EXIT(EXIT_FAILURE);
         }
         data.push_back(NULL);
@@ -342,6 +343,8 @@ void RunDbReader::open() {
             headerSize.push_back(fileSizeIfExists(db + "_h." + SSTR(i), exists));
             headers.push_back(NULL);
             headerFd.push_back(-1);
+            headerFrames.push_back(std::vector<HeaderFrame>());
+            headerRawSize.push_back(headerSize.back());
             if (exists == false) {
                 Debug(Debug::ERROR) << "Header file " << (db + "_h." + SSTR(i)) << " is missing\n";
                 EXIT(EXIT_FAILURE);
@@ -355,7 +358,7 @@ void RunDbReader::open() {
             return;
         }
         uint64_t header[3];
-        const uint64_t words = runs.entryCount() / 64 + (runs.entryCount() % 64 != 0);
+        const uint64_t words = index.getSize() / 64 + (index.getSize() % 64 != 0);
         struct stat sb;
         if (fstat(fd, &sb) != 0
             || (size_t) sb.st_size < sizeof(header) + words * sizeof(uint64_t)) {
@@ -363,42 +366,35 @@ void RunDbReader::open() {
             EXIT(EXIT_FAILURE);
         }
         if (pread(fd, header, sizeof(header), 0) != (ssize_t) sizeof(header)
-            || header[0] != VALID_MAGIC) {
-            Debug(Debug::ERROR) << "File " << validPath << " is not a valid bitmap\n";
+            || header[0] != KEPT_BITMAP_MAGIC) {
+            Debug(Debug::ERROR) << "File " << validPath << " is not a kept bitmap\n";
             EXIT(EXIT_FAILURE);
         }
-        if (header[1] != runs.entryCount()) {
+        if (header[1] != index.getSize()) {
             Debug(Debug::ERROR) << "Bitmap " << validPath << " covers " << header[1]
-                                << " sequences, " << db << " holds " << runs.entryCount() << "\n";
+                                << " sequences, " << db << " holds " << index.getSize() << "\n";
             EXIT(EXIT_FAILURE);
         }
-        validSize = sizeof(header) + words * sizeof(uint64_t);
-        void *at = mmap(NULL, validSize, PROT_READ, MAP_PRIVATE, fd, 0);
+        keptSize = sizeof(header) + words * sizeof(uint64_t);
+        void *at = mmap(NULL, keptSize, PROT_READ, MAP_PRIVATE, fd, 0);
         if (at == MAP_FAILED) {
-            Debug(Debug::ERROR) << "Cannot map " << validPath << ", " << validSize << " byte\n";
+            Debug(Debug::ERROR) << "Cannot map " << validPath << ", " << keptSize << " byte\n";
             EXIT(EXIT_FAILURE);
         }
         ::close(fd);
-        validMap = at;
-        valid = reinterpret_cast<const uint64_t *>(static_cast<const char *>(at) + sizeof(header));
-        validCount = words;
-        validLoaded = true;
+        keptMap = at;
+        kept = reinterpret_cast<const uint64_t *>(static_cast<const char *>(at) + sizeof(header));
+        keptCount = words;
+        keptLoaded = true;
     }
 }
 
-void RunDbReader::close() {
-    if (useCache) {
-        Debug(Debug::INFO) << "Chunk cache: " << cache.hits << " hits, " << cache.misses << " misses ("
-                           << ((cache.misses * ChunkCache::CHUNK) >> 30) << " GB read), " << cache.busy
-                           << " reads made on their own\n";
-        cache.close();
-        useCache = false;
-    }
-    if (validMap != NULL) {
-        munmap(validMap, validSize);
-        validMap = NULL;
-        valid = NULL;
-        validLoaded = false;
+void Lin8DbReader::close() {
+    if (keptMap != NULL) {
+        munmap(keptMap, keptSize);
+        keptMap = NULL;
+        kept = NULL;
+        keptLoaded = false;
     }
     for (size_t i = 0; i < batch.size(); i++) {
         delete batch[i];
@@ -422,9 +418,11 @@ void RunDbReader::close() {
     dataSize.clear();
     headers.clear();
     headerSize.clear();
+    headerFrames.clear();
+    headerRawSize.clear();
 }
 
-void RunDbReader::mapFile(uint32_t file) const {
+void Lin8DbReader::mapFile(uint32_t file) const {
     char *at = NULL;
 #pragma omp atomic read
     at = data[file];
@@ -443,11 +441,8 @@ void RunDbReader::mapFile(uint32_t file) const {
     }
 }
 
-void RunDbReader::mapHeader(uint32_t file) const {
-    char *at = NULL;
-#pragma omp atomic read
-    at = headers[file];
-    if (at != NULL || headerSize[file] == 0) {
+void Lin8DbReader::mapHeader(uint32_t file) const {
+    if (__atomic_load_n(&headers[file], __ATOMIC_ACQUIRE) != NULL || headerSize[file] == 0) {
         return;
     }
 #pragma omp critical(rundb_map)
@@ -456,15 +451,45 @@ void RunDbReader::mapHeader(uint32_t file) const {
             int fd = -1;
             char *mapped = mapFileReadOnly(db + "_h." + SSTR(file), headerSize[file], fd);
             headerFd[file] = fd;
-#pragma omp atomic write
-            headers[file] = mapped;
+            loadHeaderFrames(file, mapped);
+            __atomic_store_n(&headers[file], mapped, __ATOMIC_RELEASE);
         }
     }
 }
 
-const char *RunDbReader::fileData(uint32_t file, uint64_t offset) const {
+void Lin8DbReader::loadHeaderFrames(uint32_t file, const char *mapped) const {
+    const size_t footer = 2 * sizeof(uint64_t);
+    if (headerSize[file] < footer) {
+        return;
+    }
+    uint64_t tail[2];
+    memcpy(tail, mapped + headerSize[file] - footer, footer);
+    if (tail[1] != HEADER_FRAMES_MAGIC) {
+        return;
+    }
+    const uint64_t count = tail[0];
+    if (count > (headerSize[file] - footer) / sizeof(HeaderFrame)) {
+        Debug(Debug::ERROR) << "Header file " << file << " of " << db << " declares " << count
+                            << " frames but is only " << headerSize[file] << " byte long\n";
+        EXIT(EXIT_FAILURE);
+    }
+    const size_t table = count * sizeof(HeaderFrame);
+    headerFrames[file].resize(count);
+    memcpy(headerFrames[file].data(), mapped + headerSize[file] - footer - table, table);
+    for (size_t i = 0; i < count; i++) {
+        const HeaderFrame &f = headerFrames[file][i];
+        if (f.packedAt + f.packedSize > headerSize[file] - footer - table
+            || (i > 0 && f.rawAt != headerFrames[file][i - 1].rawAt + headerFrames[file][i - 1].rawSize)) {
+            Debug(Debug::ERROR) << "Header file " << file << " of " << db << " has a broken frame table at " << i << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+    headerRawSize[file] = count == 0 ? 0 : headerFrames[file].back().rawAt + headerFrames[file].back().rawSize;
+}
+
+const char *Lin8DbReader::fileData(uint32_t file, uint64_t offset) const {
     if (file >= data.size() || offset > dataSize[file]) {
-        Debug(Debug::ERROR) << "Run table points at file " << file << " offset " << offset
+        Debug(Debug::ERROR) << "Range table points at file " << file << " offset " << offset
                             << ", outside the " << data.size() << " data files of " << db << "\n";
         EXIT(EXIT_FAILURE);
     }
@@ -472,30 +497,30 @@ const char *RunDbReader::fileData(uint32_t file, uint64_t offset) const {
     return data[file] + offset;
 }
 
-const char *RunDbReader::getData(uint64_t rank) const {
-    const size_t segment = runs.runOf(rank);
-    return fileData(runs[segment].fileIdx(), runs.offsetIn(segment, rank));
+const char *Lin8DbReader::getData(uint64_t rank) const {
+    const size_t range = index.rangeIndexOf(rank);
+    return fileData(index[range].fileIndex(), index.offsetInRange(range, rank));
 }
 
-uint32_t RunDbReader::getSeqLen(uint64_t rank, Cursor &cursor) const {
-    cursor.at = runs.runOfFrom(rank, cursor.at);
-    return runs[cursor.at].seqLen();
+uint32_t Lin8DbReader::getSeqLen(uint64_t rank, Cursor &cursor) const {
+    cursor.at = index.rangeIndexFrom(rank, cursor.at);
+    return index[cursor.at].getSeqLen();
 }
 
-const char *RunDbReader::getData(uint64_t rank, Cursor &cursor) const {
-    cursor.at = runs.runOfFrom(rank, cursor.at);
-    return fileData(runs[cursor.at].fileIdx(), runs.offsetIn(cursor.at, rank));
+const char *Lin8DbReader::getData(uint64_t rank, Cursor &cursor) const {
+    cursor.at = index.rangeIndexFrom(rank, cursor.at);
+    return fileData(index[cursor.at].fileIndex(), index.offsetInRange(cursor.at, rank));
 }
 
-bool RunDbReader::isValid(uint64_t rank) const {
-    if (validLoaded == false) {
+bool Lin8DbReader::isKept(uint64_t rank) const {
+    if (keptLoaded == false) {
         return true;
     }
-    return (valid[rank >> 6] & (uint64_t(1) << (rank & 63))) != 0;
+    return (kept[rank >> 6] & (uint64_t(1) << (rank & 63))) != 0;
 }
 
-void RunDbReader::releaseFileSlot(size_t fileSlot) {
-    for (size_t file = fileSlot; file < data.size(); file += runs.filesPerNode()) {
+void Lin8DbReader::releaseFileSlot(size_t fileSlot) {
+    for (size_t file = fileSlot; file < data.size(); file += index.filesPerNode()) {
         unmapAndDrop(data[file], dataFd[file], dataSize[file]);
         if (file < headers.size()) {
             unmapAndDrop(headers[file], headerFd[file], headerSize[file]);
@@ -503,43 +528,75 @@ void RunDbReader::releaseFileSlot(size_t fileSlot) {
     }
 }
 
-uint64_t RunDbReader::countValid() const {
-    if (validLoaded == false) {
-        return runs.entryCount();
+uint64_t Lin8DbReader::countKept() const {
+    if (keptLoaded == false) {
+        return index.getSize();
     }
     uint64_t count = 0;
-    for (size_t i = 0; i < validCount; i++) {
-        count += static_cast<uint64_t>(__builtin_popcountll(valid[i]));
+    for (size_t i = 0; i < keptCount; i++) {
+        count += static_cast<uint64_t>(__builtin_popcountll(kept[i]));
     }
     return count;
 }
 
-RunDbReader::HeaderStream::HeaderStream(const RunDbReader &owner)
-    : owner(owner), segment(0), left(0), at(0) {
+Lin8DbReader::HeaderStream::HeaderStream(const Lin8DbReader &owner)
+    : owner(owner), range(0), left(0), at(0), frameFile(0), frame(0) {
     if (owner.headers.empty()) {
         Debug(Debug::ERROR) << "Headers of " << owner.db << " were not opened\n";
         EXIT(EXIT_FAILURE);
     }
 }
 
-bool RunDbReader::HeaderStream::next(const char *&begin, size_t &length) {
+// the text holding uncompressed offset `at`, straight from the mapping or from the frame that covers it
+const char *Lin8DbReader::HeaderStream::frameText(uint32_t file, size_t &avail) {
+    const std::vector<HeaderFrame> &frames = owner.headerFrames[file];
+    if (frames.empty()) {
+        avail = owner.headerSize[file] - at;
+        return owner.headers[file] + at;
+    }
+    if (raw.empty() || file != frameFile || at < frames[frame].rawAt
+        || at >= frames[frame].rawAt + frames[frame].rawSize) {
+        frame = std::upper_bound(frames.begin(), frames.end(), at,
+                                 [](uint64_t a, const HeaderFrame &f) { return a < f.rawAt; }) - frames.begin() - 1;
+        frameFile = file;
+        const HeaderFrame &f = frames[frame];
+        raw.resize(f.rawSize);
+        const size_t got = ZSTD_decompress(raw.data(), raw.size(), owner.headers[file] + f.packedAt, f.packedSize);
+        if (ZSTD_isError(got) || got != f.rawSize) {
+            Debug(Debug::ERROR) << "Header file " << file << " of " << owner.db << " frame " << frame
+                                << " does not decompress: " << (ZSTD_isError(got) ? ZSTD_getErrorName(got) : "short") << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+    const size_t in = at - frames[frame].rawAt;
+    avail = frames[frame].rawSize - in;
+    return raw.data() + in;
+}
+
+bool Lin8DbReader::HeaderStream::next(const char *&begin, size_t &length) {
     while (left == 0) {
-        if (segment >= owner.runs.size()) {
+        if (range >= owner.index.rangeCount()) {
             return false;
         }
-        left = owner.runs.rankEnd(segment) - owner.runs[segment].rankBase();
-        at = owner.runs[segment].hdrBase();
-        segment++;
+        left = owner.index.rankAfter(range) - owner.index[range].firstRank();
+        at = owner.index[range].headerOffset();
+        range++;
     }
-    const uint32_t file = owner.runs[segment - 1].fileIdx();
-    if (file >= owner.headers.size() || at >= owner.headerSize[file]) {
-        Debug(Debug::ERROR) << "Length run " << (segment - 1) << " of " << owner.db
+    const uint32_t file = owner.index[range - 1].fileIndex();
+    if (file >= owner.headers.size()) {
+        Debug(Debug::ERROR) << "Length range " << (range - 1) << " of " << owner.db
                             << " points past header file " << file << "\n";
         EXIT(EXIT_FAILURE);
     }
     owner.mapHeader(file);
-    const char *from = owner.headers[file] + at;
-    const char *end = static_cast<const char *>(memchr(from, '\n', owner.headerSize[file] - at));
+    if (at >= owner.headerRawSize[file]) {
+        Debug(Debug::ERROR) << "Length range " << (range - 1) << " of " << owner.db
+                            << " points past header file " << file << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    size_t avail = 0;
+    const char *from = frameText(file, avail);
+    const char *end = static_cast<const char *>(memchr(from, '\n', avail));
     if (end == NULL) {
         Debug(Debug::ERROR) << "Header file " << file << " of " << owner.db
                             << " does not end with a newline\n";
@@ -555,9 +612,10 @@ bool RunDbReader::HeaderStream::next(const char *&begin, size_t &length) {
 static const size_t DIRECT_BLOCK = 512;
 static const unsigned RING_DEPTH = 1024;
 
-void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
-                            size_t memoryBudget, int revisit, int ownCache) {
+void Lin8DbReader::openBatch(unsigned int threads, size_t arenaBytes,
+                            size_t memoryBudget, int revisit, int access) {
     directFd.assign(data.size(), -1);
+    batchAccess = access;
     const size_t arenaTotal = (size_t) threads * (arenaBytes + LANES * DIRECT_BLOCK);
     if (arenaTotal >= memoryBudget) {
         Debug(Debug::ERROR) << "Read arenas for " << threads << " thread need "
@@ -566,27 +624,18 @@ void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
         EXIT(EXIT_FAILURE);
     }
     const size_t budget = memoryBudget - arenaTotal;
-    const uint64_t sequenceBytes = runs.totalBytes();
-    // GPFS serves reads from its own pagepool and keeps nothing in the page cache, so a pass that
-    // reads the same pieces again gets them over the network again; then the reader keeps them
-    struct statfs fs;
-    const bool gpfs = data.empty() == false && statfs((db + ".0").c_str(), &fs) == 0 && fs.f_type == 0x47504653;
-    // a tenth of the budget stays free for the pass's own tables
-    useCache = revisit == READ_SCATTERED && (ownCache == 1 || (ownCache < 0 && gpfs))
-               && cache.open(budget / 10 * 9);
-    // the cache is filled with direct reads, so the kernel does not hold a second copy
-    wantDirect = useCache || (revisit == READ_ONCE && sequenceBytes > budget / 2);
+    const uint64_t sequenceBytes = index.getDataSize();
+    wantDirect = revisit == READ_ONCE && sequenceBytes > budget / 2;
     Debug(Debug::INFO) << "Sequence data: " << (sequenceBytes >> 30) << " GB, budget "
                        << (budget >> 30) << " GB after " << (arenaTotal >> 20)
-                       << " MB read arena, reading "
-                       << (useCache ? "into an own cache of " + SSTR((cache.chunkCount() * ChunkCache::CHUNK) >> 30)
-                                          + " GB" + (gpfs ? " (GPFS)" : "")
-                                    : wantDirect ? "past the page cache" : "through the page cache") << "\n";
+                       << " MB read buffer, reading "
+                       << (wantDirect ? "past the OS cache" : "through the OS cache")
+                       << (access == ACCESS_RANDOM ? ", advising random access" : access == ACCESS_SEQUENTIAL ? ", advising sequential access" : "") << "\n";
     const size_t laneBytes = arenaBytes / LANES;
-    const size_t longest = 2 * ((size_t) runs.maxSeqLen() + DIRECT_BLOCK);
+    const size_t longest = 2 * ((size_t) index.getMaxSeqLen() + DIRECT_BLOCK);
     if (laneBytes < longest) {
         Debug(Debug::ERROR) << "A read lane of " << laneBytes << " byte cannot hold two sequences of "
-                            << runs.maxSeqLen() << " byte, which needs " << longest << "\n";
+                            << index.getMaxSeqLen() << " byte, which needs " << longest << "\n";
         EXIT(EXIT_FAILURE);
     }
     for (unsigned int i = 0; i < threads; i++) {
@@ -603,7 +652,7 @@ void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
     }
 }
 
-int RunDbReader::directOf(uint32_t file) const {
+int Lin8DbReader::directOf(uint32_t file) const {
     int fd = -1;
 #pragma omp atomic read
     fd = directFd[file];
@@ -622,6 +671,11 @@ int RunDbReader::directOf(uint32_t file) const {
                     EXIT(EXIT_FAILURE);
                 }
             }
+            if (batchAccess == ACCESS_RANDOM) {
+                posix_fadvise(opened, 0, 0, POSIX_FADV_RANDOM);
+            } else if (batchAccess == ACCESS_SEQUENTIAL) {
+                posix_fadvise(opened, 0, 0, POSIX_FADV_SEQUENTIAL);
+            }
 #pragma omp atomic write
             directFd[file] = opened;
         }
@@ -631,15 +685,15 @@ int RunDbReader::directOf(uint32_t file) const {
     return fd;
 }
 
-const char *RunDbReader::batchQueryAt(unsigned int thread, unsigned int lane) const {
+const char *Lin8DbReader::batchQueryAt(unsigned int thread, unsigned int lane) const {
     return batch[thread]->lane[lane].queryAt;
 }
 
-const char *RunDbReader::batchAt(unsigned int thread, unsigned int lane, size_t member) const {
+const char *Lin8DbReader::batchAt(unsigned int thread, unsigned int lane, size_t member) const {
     return batch[thread]->lane[lane].memberAt[member];
 }
 
-size_t RunDbReader::batchRoomFor(uint32_t seqLen) const {
+size_t Lin8DbReader::batchRoomFor(uint32_t seqLen) const {
     if (batch.empty()) {
         return 0;
     }
@@ -647,52 +701,28 @@ size_t RunDbReader::batchRoomFor(uint32_t seqLen) const {
     return room / ((size_t) seqLen + DIRECT_BLOCK);
 }
 
-void RunDbReader::awaitBatch(unsigned int thread, unsigned int lane) const {
-    BatchLane &at = batch[thread]->lane[lane];
-    at.ring.await(db.c_str());
-    for (size_t i = 0; i < at.pieces.size(); i++) {
-        const BatchLane::Piece &piece = at.pieces[i];
-        if (piece.fill) {
-            cache.filled(piece.slot);
-        }
-        memcpy(piece.to, cache.memoryOf(piece.slot) + piece.from, piece.length);
-        cache.release(piece.slot, false);
-    }
-    at.pieces.clear();
+void Lin8DbReader::awaitBatch(unsigned int thread, unsigned int lane) const {
+    batch[thread]->lane[lane].ring.await(db.c_str());
 }
 
-bool RunDbReader::appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor,
+bool Lin8DbReader::appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor,
                                   const char *&at) const {
-    cursor.at = runs.runOfFrom(rank, cursor.at);
-    const uint64_t offset = runs.offsetIn(cursor.at, rank);
-    const size_t length = runs[cursor.at].seqLen();
-    const uint32_t file = runs[cursor.at].fileIdx();
-    if (useCache) {
-        const int took = appendCachedRead(lane, file, offset, length, at);
-        if (took >= 0) {
-            return took == 1;
-        }
-    }
-    return appendDirectRead(lane, directOf(file), offset, length, at);
-}
-
-// the sequence's 512-byte blocks straight into the arena, joined onto the previous read when
-// they follow it in the file
-bool RunDbReader::appendDirectRead(BatchLane &lane, int fd, uint64_t offset, size_t length,
-                                   const char *&at) const {
+    cursor.at = index.rangeIndexFrom(rank, cursor.at);
+    const uint64_t offset = index.offsetInRange(cursor.at, rank);
+    const size_t length = index[cursor.at].getSeqLen();
+    const int fd = directOf(index[cursor.at].fileIndex());
     const uint64_t blockFrom = offset - offset % DIRECT_BLOCK;
     const uint64_t blockUntil = ((offset + length + DIRECT_BLOCK - 1) / DIRECT_BLOCK) * DIRECT_BLOCK;
 
     const size_t room = lane.arena.size() - DIRECT_BLOCK;
-    const size_t used = lane.used;
+    size_t used = 0;
     std::vector<IoRing::Read> &reads = lane.ring.list();
     if (reads.empty() == false) {
         IoRing::Read &last = reads.back();
         char *into = static_cast<char *>(last.into);
+        used = (size_t) (into - lane.aligned) + last.length;
         const uint64_t end = last.offset + last.length;
-        // only a read that ends where the arena ends can grow; a chunk read went elsewhere
-        if (into + last.length == lane.aligned + used && last.fd == fd && last.offset <= blockFrom
-            && blockFrom <= end) {
+        if (last.fd == fd && last.offset <= blockFrom && blockFrom <= end) {
             const size_t extra = (blockUntil > end) ? (size_t) (blockUntil - end) : 0;
             if (used + extra > room) {
                 return false;
@@ -700,7 +730,6 @@ bool RunDbReader::appendDirectRead(BatchLane &lane, int fd, uint64_t offset, siz
             last.length += extra;
             last.required = (size_t) (offset + length - last.offset);
             at = into + (size_t) (offset - last.offset);
-            lane.used += extra;
             return true;
         }
     }
@@ -716,70 +745,63 @@ bool RunDbReader::appendDirectRead(BatchLane &lane, int fd, uint64_t offset, siz
     read.required = (size_t) (offset + length - blockFrom);
     reads.push_back(read);
     at = lane.aligned + used + (size_t) (offset - blockFrom);
-    lane.used += span;
     return true;
 }
 
-// 1: the sequence is copied out of the cache once the batch landed; 0: no arena room;
-// -1: a chunk of it is being filled by another thread or has no free slot, read it directly
-int RunDbReader::appendCachedRead(BatchLane &lane, uint32_t file, uint64_t offset, size_t length,
-                                  const char *&at) const {
-    // the arena stays 512-byte aligned for a direct read after this one; +1 is the terminator
-    const size_t need = ((length + 1 + DIRECT_BLOCK - 1) / DIRECT_BLOCK) * DIRECT_BLOCK;
-    if (lane.used + need > lane.arena.size() - DIRECT_BLOCK) {
-        return 0;
+size_t Lin8DbReader::layoutReads(const uint64_t *ranks, size_t n, char *arena, std::vector<IoRing::Read> &reads,
+                                std::vector<const char *> &at) const {
+    reads.clear();
+    at.resize(n);
+    char *aligned = arena;
+    if (arena != NULL) {
+        const size_t off = reinterpret_cast<uintptr_t>(arena) % DIRECT_BLOCK;
+        aligned = arena + (off == 0 ? 0 : DIRECT_BLOCK - off);
     }
-    char *to = lane.aligned + lane.used;
-    const size_t first = lane.pieces.size();
-    const size_t firstRead = lane.ring.list().size();
-    for (uint64_t pos = offset; pos < offset + length;) {
-        BatchLane::Piece piece;
-        piece.from = static_cast<uint32_t>(pos % ChunkCache::CHUNK);
-        piece.length = static_cast<uint32_t>(std::min<uint64_t>(offset + length - pos, ChunkCache::CHUNK - piece.from));
-        piece.to = to + (pos - offset);
-        ChunkCache::Outcome got = cache.acquire(file, pos / ChunkCache::CHUNK, piece.slot);
-        // a chunk this lane is itself filling has landed by the time it copies; another lane's may not have
-        if (got == ChunkCache::PENDING) {
-            const bool mine = lane.pieces.empty() == false && lane.pieces.back().slot == piece.slot;
-            if (mine == false) {
-                cache.release(piece.slot, false);
-                got = ChunkCache::BUSY;
+    Cursor cursor;
+    size_t used = 0;
+    for (size_t i = 0; i < n; i++) {
+        cursor.at = index.rangeIndexFrom(ranks[i], cursor.at);
+        const uint64_t offset = index.offsetInRange(cursor.at, ranks[i]);
+        const size_t length = index[cursor.at].getSeqLen();
+        const int fd = directOf(index[cursor.at].fileIndex());
+        const uint64_t blockFrom = offset - offset % DIRECT_BLOCK;
+        const uint64_t blockUntil = ((offset + length + DIRECT_BLOCK - 1) / DIRECT_BLOCK) * DIRECT_BLOCK;
+        if (reads.empty() == false && reads.back().fd == fd && reads.back().offset <= blockFrom
+            && blockFrom <= reads.back().offset + reads.back().length) {
+            IoRing::Read &last = reads.back();
+            const uint64_t end = last.offset + last.length;
+            if (blockUntil > end) {
+                last.length += (size_t) (blockUntil - end);
+                used += (size_t) (blockUntil - end);
             }
+            last.required = std::max(last.required, (size_t) (offset + length - last.offset));
+            at[i] = static_cast<char *>(last.into) + (size_t) (offset - last.offset);
+            continue;
         }
-        if (got == ChunkCache::BUSY) {
-            for (size_t i = first; i < lane.pieces.size(); i++) {
-                cache.release(lane.pieces[i].slot, lane.pieces[i].fill);
-            }
-            lane.pieces.resize(first);
-            lane.ring.list().resize(firstRead);
-            return -1;
-        }
-        piece.fill = got == ChunkCache::MISS;
-        if (piece.fill) {
-            IoRing::Read read;
-            read.into = cache.memoryOf(piece.slot);
-            read.fd = directOf(file);
-            read.offset = pos - piece.from;
-            read.required = (size_t) std::min<uint64_t>(ChunkCache::CHUNK, dataSize[file] - read.offset);
-            read.length = ((read.required + DIRECT_BLOCK - 1) / DIRECT_BLOCK) * DIRECT_BLOCK;
-            lane.ring.list().push_back(read);
-        }
-        lane.pieces.push_back(piece);
-        pos += piece.length;
+        IoRing::Read read;
+        read.into = aligned + used;
+        read.fd = fd;
+        read.offset = blockFrom;
+        read.length = (size_t) (blockUntil - blockFrom);
+        read.required = (size_t) (offset + length - blockFrom);
+        reads.push_back(read);
+        at[i] = aligned + used + (size_t) (offset - blockFrom);
+        used += read.length;
     }
-    to[length] = '\0';
-    lane.used += need;
-    at = to;
-    return 1;
+    return used + DIRECT_BLOCK;
 }
 
-size_t RunDbReader::startBatch(uint64_t queryRank, const uint64_t *members, size_t n,
+void Lin8DbReader::submitReads(unsigned int thread, unsigned int lane, const IoRing::Read *reads, size_t n) const {
+    BatchLane &at = batch[thread]->lane[lane];
+    at.ring.list().assign(reads, reads + n);
+    at.ring.submit(db.c_str());
+}
+
+size_t Lin8DbReader::startBatch(uint64_t queryRank, const uint64_t *members, size_t n,
                               unsigned int thread, unsigned int lane) const {
     BatchLane &at = batch[thread]->lane[lane];
     at.memberAt.clear();
     at.ring.list().clear();
-    at.used = 0;
-    at.pieces.clear();
     Cursor cursor;
     appendBatchRead(at, queryRank, cursor, at.queryAt);
     size_t loaded = 0;

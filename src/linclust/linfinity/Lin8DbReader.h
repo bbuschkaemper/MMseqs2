@@ -2,7 +2,6 @@
 #define MMSEQS_READLINDB_H
 
 #include "Lin8Db.h"
-#include "Lin8ChunkCache.h"
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -13,6 +12,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <ctime>
 
 struct IoRing {
     struct Read {
@@ -47,9 +47,9 @@ private:
     unsigned inflight;
 };
 
-class RunDbReader {
+class Lin8DbReader {
 public:
-    static const uint64_t VALID_MAGIC;
+    static const uint64_t KEPT_BITMAP_MAGIC;
 
     class Cursor {
     public:
@@ -59,17 +59,17 @@ public:
 
     static const char *KEPT_BITMAP_SUFFIX;
 
-    RunDbReader(const std::string &db, bool withHeaders = false);
-    ~RunDbReader();
+    Lin8DbReader(const std::string &db, bool withHeaders = false);
+    ~Lin8DbReader();
 
     void open();
     void close();
 
-    uint64_t getSize() const { return runs.entryCount(); }
-    uint64_t getTotalBytes() const { return runs.totalBytes(); }
-    const SequenceLocator &getSequenceLocator() const { return runs; }
+    uint64_t getSize() const { return index.getSize(); }
+    uint64_t getDataSize() const { return index.getDataSize(); }
+    const Lin8DbIndex &getIndex() const { return index; }
 
-    uint32_t getSeqLen(uint64_t rank) const { return runs.seqLen(rank); }
+    uint32_t getSeqLen(uint64_t rank) const { return index.getSeqLen(rank); }
     const char *getData(uint64_t rank) const;
 
     uint32_t getSeqLen(uint64_t rank, Cursor &cursor) const;
@@ -77,12 +77,12 @@ public:
 
     static const int READ_ONCE = 0;
     static const int READ_AGAIN = 1;
-    // read again in small pieces from anywhere in the file, so the pass depends on those pieces
-    // staying cached between visits. ownCache: 1 the reader keeps them, 0 the kernel does, -1 the
-    // reader does only on a filesystem known not to
-    static const int READ_SCATTERED = 2;
+    // how the batch reads walk the data: a parallel file system prefetches whole blocks unless told the reads are random
+    static const int ACCESS_UNHINTED = 0;
+    static const int ACCESS_SEQUENTIAL = 1;
+    static const int ACCESS_RANDOM = 2;
     void openBatch(unsigned int threads, size_t arenaBytes, size_t memoryBudget, int revisit = READ_ONCE,
-                   int ownCache = -1);
+                   int access = ACCESS_UNHINTED);
 
     size_t batchRoomFor(uint32_t seqLen) const;
 
@@ -90,47 +90,57 @@ public:
                       unsigned int lane) const;
     void awaitBatch(unsigned int thread, unsigned int lane) const;
     const char *batchQueryAt(unsigned int thread, unsigned int lane) const;
+    // lays ranks sorted by file position out in one arena, one read a run of touched blocks; NULL arena only measures
+    size_t layoutReads(const uint64_t *ranks, size_t n, char *arena, std::vector<IoRing::Read> &reads,
+                       std::vector<const char *> &at) const;
+    void submitReads(unsigned int thread, unsigned int lane, const IoRing::Read *reads, size_t n) const;
     const char *batchAt(unsigned int thread, unsigned int lane, size_t member) const;
 
     static const unsigned int LANES = 2;
 
-    bool isValid(uint64_t rank) const;
-    uint64_t countValid() const;
-    bool hasValid() const { return validLoaded; }
-    const uint64_t *validWords() const { return valid; }
-    size_t validWordCount() const { return validCount; }
+    bool isKept(uint64_t rank) const;
+    uint64_t countKept() const;
+    bool hasKeptBitmap() const { return keptLoaded; }
+    const uint64_t *keptWords() const { return kept; }
+    size_t keptWordCount() const { return keptCount; }
 
     void releaseFileSlot(size_t suffix);
 
-    uint64_t rankAtByte(uint64_t globalByte) const { return runs.rankAtByte(globalByte); }
+    uint64_t rankAtByte(uint64_t globalByte) const { return index.rankAtByte(globalByte); }
+
+    // --compressed header files: zstd frames plus a table keyed by uncompressed offset
+    struct HeaderFrame {
+        uint64_t rawAt;
+        uint64_t packedAt;
+        uint64_t rawSize;
+        uint64_t packedSize;
+    };
+    static const uint64_t HEADER_FRAMES_MAGIC;
 
     class HeaderStream {
     public:
-        HeaderStream(const RunDbReader &owner);
+        HeaderStream(const Lin8DbReader &owner);
+        // begin stays kept only until the next call
         bool next(const char *&begin, size_t &length);
     private:
-        const RunDbReader &owner;
-        size_t segment;
+        const char *frameText(uint32_t file, size_t &avail);
+        const Lin8DbReader &owner;
+        size_t range;
         uint64_t left;
         size_t at;
+        uint32_t frameFile;
+        size_t frame;
+        std::vector<char> raw;
     };
 
 private:
     struct BatchLane {
         std::vector<char> arena;
         char *aligned;
-        size_t used;
         const char *queryAt;
         std::vector<const char *> memberAt;
         IoRing ring;
-        // with the own cache: a run of bytes to copy from a chunk into the arena once the batch landed
-        struct Piece {
-            uint32_t slot, from, length;
-            char *to;
-            bool fill;
-        };
-        std::vector<Piece> pieces;
-        BatchLane() : aligned(NULL), used(0), queryAt(NULL) {}
+        BatchLane() : aligned(NULL), queryAt(NULL) {}
     };
     struct BatchWorker {
         BatchLane lane[LANES];
@@ -138,9 +148,6 @@ private:
     mutable std::vector<BatchWorker *> batch;
 
     bool appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor, const char *&at) const;
-    bool appendDirectRead(BatchLane &lane, int fd, uint64_t offset, size_t length, const char *&at) const;
-    int appendCachedRead(BatchLane &lane, uint32_t file, uint64_t offset, size_t length,
-                         const char *&at) const;
     int directOf(uint32_t file) const;
     const char *fileData(uint32_t file, uint64_t offset) const;
     void mapFile(uint32_t file) const;
@@ -148,7 +155,7 @@ private:
 
     std::string db;
     bool withHeaders;
-    SequenceLocator runs;
+    Lin8DbIndex index;
     mutable std::vector<char *> data;
     mutable std::vector<int> dataFd;
     mutable std::vector<int> directFd;
@@ -156,14 +163,16 @@ private:
     std::vector<size_t> dataSize;
     mutable std::vector<char *> headers;
     std::vector<size_t> headerSize;
-    const uint64_t *valid;
-    void *validMap;
-    size_t validSize;
-    size_t validCount;
-    bool validLoaded;
+    mutable std::vector<std::vector<HeaderFrame> > headerFrames;
+    mutable std::vector<uint64_t> headerRawSize;
+    void loadHeaderFrames(uint32_t file, const char *mapped) const;
+    const uint64_t *kept;
+    void *keptMap;
+    size_t keptSize;
+    size_t keptCount;
+    bool keptLoaded;
     mutable bool wantDirect;
-    mutable ChunkCache cache;
-    bool useCache;
+    int batchAccess;
 };
 
 class ClusterAssignmentBitmap {
@@ -259,8 +268,12 @@ public:
                 if (at >= floorRepRankBlock) {
                     break;
                 }
-                if (waited == 30) {
-                    Debug(Debug::INFO) << "Waiting for " << path << "\n";
+                static time_t lastWaitLog = 0;
+                const time_t nowSec = time(NULL);
+                if (waited >= 30 && nowSec - lastWaitLog >= 60) {
+                    Debug(Debug::INFO) << "Still waiting for the decider to publish block " << at
+                                       << " (" << waited << "s)\n";
+                    lastWaitLog = nowSec;
                 }
                 if (waited >= 3600) {
                     Debug(Debug::ERROR) << "Waited " << waited << "s for " << path
