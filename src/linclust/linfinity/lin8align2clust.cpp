@@ -394,7 +394,7 @@ static void measurePart(const Lin8DbReader &reader, ReadSlice &slice, unsigned i
     }
     SORT_SERIAL(part.ranks.begin(), part.ranks.end());
     part.ranks.erase(std::unique(part.ranks.begin(), part.ranks.end()), part.ranks.end());
-    part.bytes = reader.layoutReads(part.ranks.data(), part.ranks.size(), NULL, part.reads, part.at);
+    part.bytes = reader.layoutReads(part.ranks.data(), part.ranks.size(), NULL, part.reads, part.at, thread, 0);
 }
 
 static void placeParts(ReadSlice &slice) {
@@ -499,7 +499,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
     const size_t batchRows = (size_t) threads * Lin8DbReader::LANES * MEMBERS_PER_ALIGN_BATCH * 4;
     Debug(Debug::INFO) << "Batches of " << batchRows << " rows\n";
     reader.openBatch(threads, ARENA_BYTES, Util::computeMemory(par.splitMemoryLimit),
-                     Lin8DbReader::READ_AGAIN, Lin8DbReader::ACCESS_RANDOM);
+                     Lin8DbReader::READ_AGAIN, Lin8DbReader::ACCESS_RANDOM, par.lin8ReadCache);
 
     SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, par.scoreBias);
     SubstitutionMatrix::FastMatrix fastMatrix = SubstitutionMatrix::createAsciiSubMat(subMat);
@@ -731,7 +731,8 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                         placeParts(slice);
                         SlicePart &part = slice.parts[thread];
                         reader.layoutReads(part.ranks.data(), part.ranks.size(),
-                                           slice.arena.data() + slice.partOffset[thread], part.reads, part.at);
+                                           slice.arena.data() + slice.partOffset[thread], part.reads, part.at,
+                                           thread, s % 2);
                         reader.submitReads(thread, s % 2, part.reads.data(), part.reads.size());
                     }
                     if (s > 0) {
@@ -754,6 +755,8 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                                              worker.aligner, par, item, slice, batchSurvivors[w], gate[thread],
                                              scorePerColThreshold, xDrop, wantText ? &batchSurvivorLines[w] : NULL);
                         }
+                        // every thread is past the loop's barrier, so no one reads the slice's chunks any more
+                        reader.releaseBatch(thread, (s - 1) % 2);
                     }
                     aligning += omp_get_wtime() - began - waited;
                 }

@@ -13,6 +13,7 @@
 #include "Util.h"
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <zstd.h>
 
 #if defined(__linux__) && defined(HAVE_LINUX_IO_URING)
@@ -316,7 +317,7 @@ const char *Lin8DbReader::KEPT_BITMAP_SUFFIX = ".clusthash_kept";
 Lin8DbReader::Lin8DbReader(const std::string &db, bool withHeaders)
     : db(db), withHeaders(withHeaders), kept(NULL),
       keptMap(NULL), keptSize(0), keptCount(0), keptLoaded(false),
-      wantDirect(true), batchAccess(ACCESS_UNHINTED) {}
+      wantDirect(true), batchAccess(ACCESS_UNHINTED), useCache(false) {}
 
 Lin8DbReader::~Lin8DbReader() {
     close();
@@ -390,6 +391,13 @@ void Lin8DbReader::open() {
 }
 
 void Lin8DbReader::close() {
+    if (useCache) {
+        Debug(Debug::INFO) << "Chunk cache: " << cache.hits << " hits, " << cache.misses << " misses ("
+                           << ((cache.misses * ChunkCache::CHUNK) >> 30) << " GB read), " << cache.busy
+                           << " reads made on their own\n";
+        cache.close();
+        useCache = false;
+    }
     if (keptMap != NULL) {
         munmap(keptMap, keptSize);
         keptMap = NULL;
@@ -613,7 +621,7 @@ static const size_t DIRECT_BLOCK = 512;
 static const unsigned RING_DEPTH = 1024;
 
 void Lin8DbReader::openBatch(unsigned int threads, size_t arenaBytes,
-                            size_t memoryBudget, int revisit, int access) {
+                            size_t memoryBudget, int revisit, int access, int ownCache) {
     directFd.assign(data.size(), -1);
     batchAccess = access;
     const size_t arenaTotal = (size_t) threads * (arenaBytes + LANES * DIRECT_BLOCK);
@@ -625,11 +633,21 @@ void Lin8DbReader::openBatch(unsigned int threads, size_t arenaBytes,
     }
     const size_t budget = memoryBudget - arenaTotal;
     const uint64_t sequenceBytes = index.getDataSize();
-    wantDirect = revisit == READ_ONCE && sequenceBytes > budget / 2;
+    // GPFS serves reads from its own pagepool and keeps nothing in the OS cache, so a pass that reads the
+    // same pieces again gets them over the network again; then the reader keeps them itself
+    struct statfs fs;
+    const bool gpfs = data.empty() == false && statfs((db + ".0").c_str(), &fs) == 0 && fs.f_type == 0x47504653;
+    // a tenth of the budget stays free for the pass's own tables
+    useCache = revisit == READ_AGAIN && access == ACCESS_RANDOM && (ownCache == 1 || (ownCache < 0 && gpfs))
+               && cache.open(budget / 10 * 9);
+    // the cache is filled with direct reads, so the kernel does not hold a second copy
+    wantDirect = useCache || (revisit == READ_ONCE && sequenceBytes > budget / 2);
     Debug(Debug::INFO) << "Sequence data: " << (sequenceBytes >> 30) << " GB, budget "
                        << (budget >> 30) << " GB after " << (arenaTotal >> 20)
                        << " MB read buffer, reading "
-                       << (wantDirect ? "past the OS cache" : "through the OS cache")
+                       << (useCache ? "into an own cache of " + SSTR((cache.chunkCount() * ChunkCache::CHUNK) >> 30)
+                                          + " GB" + (gpfs ? " (GPFS)" : "")
+                                    : wantDirect ? "past the OS cache" : "through the OS cache")
                        << (access == ACCESS_RANDOM ? ", advising random access" : access == ACCESS_SEQUENTIAL ? ", advising sequential access" : "") << "\n";
     const size_t laneBytes = arenaBytes / LANES;
     const size_t longest = 2 * ((size_t) index.getMaxSeqLen() + DIRECT_BLOCK);
@@ -702,7 +720,21 @@ size_t Lin8DbReader::batchRoomFor(uint32_t seqLen) const {
 }
 
 void Lin8DbReader::awaitBatch(unsigned int thread, unsigned int lane) const {
-    batch[thread]->lane[lane].ring.await(db.c_str());
+    BatchLane &at = batch[thread]->lane[lane];
+    at.ring.await(db.c_str());
+    for (size_t i = 0; i < at.held.size(); i++) {
+        if (at.held[i].fill) {
+            cache.filled(at.held[i].slot);
+        }
+    }
+}
+
+void Lin8DbReader::releaseBatch(unsigned int thread, unsigned int lane) const {
+    BatchLane &at = batch[thread]->lane[lane];
+    for (size_t i = 0; i < at.held.size(); i++) {
+        cache.release(at.held[i].slot, false);
+    }
+    at.held.clear();
 }
 
 bool Lin8DbReader::appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor,
@@ -749,7 +781,7 @@ bool Lin8DbReader::appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &curso
 }
 
 size_t Lin8DbReader::layoutReads(const uint64_t *ranks, size_t n, char *arena, std::vector<IoRing::Read> &reads,
-                                std::vector<const char *> &at) const {
+                                std::vector<const char *> &at, unsigned int thread, unsigned int lane) const {
     reads.clear();
     at.resize(n);
     char *aligned = arena;
@@ -757,17 +789,58 @@ size_t Lin8DbReader::layoutReads(const uint64_t *ranks, size_t n, char *arena, s
         const size_t off = reinterpret_cast<uintptr_t>(arena) % DIRECT_BLOCK;
         aligned = arena + (off == 0 ? 0 : DIRECT_BLOCK - off);
     }
+    BatchLane *hold = (arena != NULL && useCache) ? batch[thread]->lane + lane : NULL;
+    if (hold != NULL && hold->held.empty() == false) {
+        releaseBatch(thread, lane);
+    }
     Cursor cursor;
     size_t used = 0;
     for (size_t i = 0; i < n; i++) {
         cursor.at = index.rangeIndexFrom(ranks[i], cursor.at);
         const uint64_t offset = index.offsetInRange(cursor.at, ranks[i]);
         const size_t length = index[cursor.at].getSeqLen();
-        const int fd = directOf(index[cursor.at].fileIndex());
+        const uint32_t file = index[cursor.at].fileIndex();
+        const int fd = directOf(file);
+        // a sequence inside one chunk is served from the cache, and the lane keeps the chunk pinned;
+        // one across a chunk boundary, or whose chunk another thread is still filling, is read directly
+        const size_t inChunk = (size_t) (offset % ChunkCache::CHUNK);
+        if (hold != NULL && length > 0 && inChunk + length <= ChunkCache::CHUNK) {
+            const uint64_t chunk = offset / ChunkCache::CHUNK;
+            uint32_t slot = 0;
+            ChunkCache::Outcome got = cache.acquire(file, chunk, slot);
+            if (got == ChunkCache::PENDING) {
+                // a chunk this lane is itself filling has landed by the time the slice is aligned
+                if (hold->held.empty() == false && hold->held.back().slot == slot) {
+                    got = ChunkCache::HIT;
+                } else {
+                    cache.release(slot, false);
+                    got = ChunkCache::BUSY;
+                }
+            }
+            if (got != ChunkCache::BUSY) {
+                if (got == ChunkCache::MISS) {
+                    IoRing::Read read;
+                    read.into = cache.memoryOf(slot);
+                    read.fd = fd;
+                    read.offset = chunk * ChunkCache::CHUNK;
+                    read.required = (size_t) std::min<uint64_t>(ChunkCache::CHUNK, dataSize[file] - read.offset);
+                    read.length = ((read.required + DIRECT_BLOCK - 1) / DIRECT_BLOCK) * DIRECT_BLOCK;
+                    reads.push_back(read);
+                }
+                BatchLane::Held keep;
+                keep.slot = slot;
+                keep.fill = got == ChunkCache::MISS;
+                hold->held.push_back(keep);
+                at[i] = cache.memoryOf(slot) + inChunk;
+                continue;
+            }
+        }
         const uint64_t blockFrom = offset - offset % DIRECT_BLOCK;
         const uint64_t blockUntil = ((offset + length + DIRECT_BLOCK - 1) / DIRECT_BLOCK) * DIRECT_BLOCK;
+        // only a read that ends where the arena ends can grow; a chunk read went into the cache
         if (reads.empty() == false && reads.back().fd == fd && reads.back().offset <= blockFrom
-            && blockFrom <= reads.back().offset + reads.back().length) {
+            && blockFrom <= reads.back().offset + reads.back().length
+            && static_cast<char *>(reads.back().into) + reads.back().length == aligned + used) {
             IoRing::Read &last = reads.back();
             const uint64_t end = last.offset + last.length;
             if (blockUntil > end) {

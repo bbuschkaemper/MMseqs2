@@ -2,6 +2,7 @@
 #define MMSEQS_READLINDB_H
 
 #include "Lin8Db.h"
+#include "Lin8ChunkCache.h"
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -81,8 +82,11 @@ public:
     static const int ACCESS_UNHINTED = 0;
     static const int ACCESS_SEQUENTIAL = 1;
     static const int ACCESS_RANDOM = 2;
+    // ownCache: random reads of data read again depend on the pieces staying cached between visits, which the
+    // page cache of a parallel file system does not do. 1 the reader keeps them, 0 the kernel does, -1 the
+    // reader does only on a file system known not to (GPFS)
     void openBatch(unsigned int threads, size_t arenaBytes, size_t memoryBudget, int revisit = READ_ONCE,
-                   int access = ACCESS_UNHINTED);
+                   int access = ACCESS_UNHINTED, int ownCache = -1);
 
     size_t batchRoomFor(uint32_t seqLen) const;
 
@@ -91,9 +95,12 @@ public:
     void awaitBatch(unsigned int thread, unsigned int lane) const;
     const char *batchQueryAt(unsigned int thread, unsigned int lane) const;
     // lays ranks sorted by file position out in one arena, one read a run of touched blocks; NULL arena only measures
+    // with the own cache a rank inside one chunk points into the cache instead, and the lane pins that chunk
+    // until releaseBatch; a NULL arena measures as if every read were direct and touches no chunk
     size_t layoutReads(const uint64_t *ranks, size_t n, char *arena, std::vector<IoRing::Read> &reads,
-                       std::vector<const char *> &at) const;
+                       std::vector<const char *> &at, unsigned int thread, unsigned int lane) const;
     void submitReads(unsigned int thread, unsigned int lane, const IoRing::Read *reads, size_t n) const;
+    void releaseBatch(unsigned int thread, unsigned int lane) const;
     const char *batchAt(unsigned int thread, unsigned int lane, size_t member) const;
 
     static const unsigned int LANES = 2;
@@ -140,6 +147,12 @@ private:
         const char *queryAt;
         std::vector<const char *> memberAt;
         IoRing ring;
+        // chunks of the own cache this lane's slice points into
+        struct Held {
+            uint32_t slot;
+            bool fill;
+        };
+        std::vector<Held> held;
         BatchLane() : aligned(NULL), queryAt(NULL) {}
     };
     struct BatchWorker {
@@ -173,6 +186,8 @@ private:
     bool keptLoaded;
     mutable bool wantDirect;
     int batchAccess;
+    mutable ChunkCache cache;
+    bool useCache;
 };
 
 class ClusterAssignmentBitmap {
