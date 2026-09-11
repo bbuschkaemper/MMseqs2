@@ -527,8 +527,16 @@ void publishAllAtomically(std::vector<std::pair<std::string, std::string> > &pen
 #pragma omp parallel for schedule(dynamic, 4) num_threads(threads)
     for (size_t i = 0; i < pending.size(); i++) {
         const int fd = open(pending[i].first.c_str(), O_RDONLY);
-        if (fd < 0 || fsync(fd) != 0 || close(fd) != 0) {
-            Debug(Debug::ERROR) << "Cannot flush " << pending[i].first << " to storage\n";
+        if (fd < 0) {
+            Debug(Debug::ERROR) << "Cannot open " << pending[i].first << " to flush it: " << strerror(errno) << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (fsync(fd) != 0) {
+            Debug(Debug::ERROR) << "Cannot flush " << pending[i].first << " to storage: " << strerror(errno) << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (close(fd) != 0) {
+            Debug(Debug::ERROR) << "Cannot close " << pending[i].first << ": " << strerror(errno) << "\n";
             EXIT(EXIT_FAILURE);
         }
     }

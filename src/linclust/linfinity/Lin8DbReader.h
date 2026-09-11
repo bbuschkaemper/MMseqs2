@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <ctime>
+#include <thread>
 
 struct IoRing {
     struct Read {
@@ -42,6 +43,9 @@ private:
 
     bool ready;
     void *state;
+    // without a ring (io_uring disabled, as on JURECA) a helper thread does the reads, so submit
+    // still returns at once and the reads overlap with what the caller does until await
+    std::thread helper;
     std::vector<Read> reads;
     size_t queued;
     size_t done;
@@ -75,6 +79,9 @@ public:
 
     uint32_t getSeqLen(uint64_t rank, Cursor &cursor) const;
     const char *getData(uint64_t rank, Cursor &cursor) const;
+    // the data file and the byte a rank's sequence starts at
+    void locate(uint64_t rank, uint32_t &file, uint64_t &offset) const;
+    void locate(uint64_t rank, Cursor &cursor, uint32_t &file, uint64_t &offset) const;
 
     static const int READ_ONCE = 0;
     static const int READ_AGAIN = 1;

@@ -117,6 +117,9 @@ void ringClose(Ring &r) {
 IoRing::IoRing() : ready(false), state(NULL), queued(0), done(0), inflight(0) {}
 
 IoRing::~IoRing() {
+    if (helper.joinable()) {
+        helper.join();
+    }
 #if defined(__linux__) && defined(HAVE_LINUX_IO_URING)
     if (state != NULL) {
         Ring *r = static_cast<Ring *>(state);
@@ -140,6 +143,14 @@ bool IoRing::open(unsigned depth) {
 #else
     (void) depth;
 #endif
+    // said once: a kernel that refuses io_uring (kernel.io_uring_disabled) leaves every batch read
+    // to a helper thread, which is where a pass that looks I/O-bound for no reason should look first
+    static bool warned = false;
+    if (ready == false && warned == false) {
+        warned = true;
+        Debug(Debug::WARNING) << "io_uring is not available (" << strerror(errno)
+                              << "), batch reads are done by a thread per lane instead\n";
+    }
     return ready;
 }
 
@@ -239,23 +250,26 @@ void IoRing::submit(const char *what) {
     queued = 0;
     done = 0;
     inflight = 0;
+    if (helper.joinable()) {
+        helper.join();
+    }
     if (reads.empty()) {
         return;
     }
 #if defined(__linux__) && defined(HAVE_LINUX_IO_URING)
-    if (ready == false) {
-        preadAll(what);
-        done = reads.size();
+    if (ready) {
+        pump(what, false);
         return;
     }
-    pump(what, false);
-#else
-    preadAll(what);
-    done = reads.size();
 #endif
+    helper = std::thread(&IoRing::preadAll, this, what);
 }
 
 void IoRing::await(const char *what) {
+    if (helper.joinable()) {
+        helper.join();
+        done = reads.size();
+    }
     if (done >= reads.size()) {
         return;
     }
@@ -513,6 +527,18 @@ const char *Lin8DbReader::getData(uint64_t rank) const {
 uint32_t Lin8DbReader::getSeqLen(uint64_t rank, Cursor &cursor) const {
     cursor.at = index.rangeIndexFrom(rank, cursor.at);
     return index[cursor.at].getSeqLen();
+}
+
+void Lin8DbReader::locate(uint64_t rank, uint32_t &file, uint64_t &offset) const {
+    const size_t range = index.rangeIndexOf(rank);
+    file = index[range].fileIndex();
+    offset = index.offsetInRange(range, rank);
+}
+
+void Lin8DbReader::locate(uint64_t rank, Cursor &cursor, uint32_t &file, uint64_t &offset) const {
+    cursor.at = index.rangeIndexFrom(rank, cursor.at);
+    file = index[cursor.at].fileIndex();
+    offset = index.offsetInRange(cursor.at, rank);
 }
 
 const char *Lin8DbReader::getData(uint64_t rank, Cursor &cursor) const {

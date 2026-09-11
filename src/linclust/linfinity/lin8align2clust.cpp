@@ -33,6 +33,15 @@ static const size_t MEMBERS_PER_ALIGN_BATCH = 1024;
 // a batch is read in slices sorted by file position, the next one in flight while this one aligns
 static const size_t READ_SLICES = 8;
 static const size_t SLICE_MIN_ROWS = 1u << 16;
+// a slice's ranks go to the threads by the 1 MB stripe of the data they lie in, dealt round-robin:
+// the reads a slice needs cluster in the stretch of the file it has not seen yet, and a contiguous
+// split would hand all of them to one thread, which every other thread then waits for. Adjacent
+// reads still merge within a stripe.
+static const uint64_t PART_STRIPE = 1u << 20;
+
+static unsigned int partOf(uint32_t file, uint64_t offset, size_t parts) {
+    return static_cast<unsigned int>((offset / PART_STRIPE + (uint64_t) file * 7919u) % parts);
+}
 
 struct MemberBatch {
     size_t group;
@@ -177,13 +186,16 @@ struct ReadSlice {
     size_t lastItem;
     std::vector<Candidates> items;
     std::vector<std::vector<uint64_t> > gathered;
-    std::vector<uint64_t> splitters;
+    std::vector<std::vector<std::vector<uint64_t> > > dealt;   // [gathering thread][part]
     std::vector<SlicePart> parts;
     std::vector<size_t> partOffset;
     std::vector<char> arena;
 
-    const char *sequenceOf(uint64_t rank) const {
-        const SlicePart &part = parts[std::upper_bound(splitters.begin(), splitters.end(), rank) - splitters.begin()];
+    const char *sequenceOf(const Lin8DbReader &reader, uint64_t rank) const {
+        uint32_t file = 0;
+        uint64_t offset = 0;
+        reader.locate(rank, file, offset);
+        const SlicePart &part = parts[partOf(file, offset, parts.size())];
         return part.at[std::lower_bound(part.ranks.begin(), part.ranks.end(), rank) - part.ranks.begin()];
     }
 };
@@ -358,8 +370,8 @@ static void collectCandidates(const Lin8DbReader &reader, uint64_t rep, const Pa
     }
 }
 
-// each thread sorts the ranks of every threads-th item, and thread 0 picks the range splitters from its share
-static void gatherRanks(ReadSlice &slice, unsigned int thread, unsigned int threads) {
+// each thread sorts the ranks of every threads-th item and deals them to the parts by stripe
+static void gatherRanks(const Lin8DbReader &reader, ReadSlice &slice, unsigned int thread, unsigned int threads) {
     std::vector<uint64_t> &ranks = slice.gathered[thread];
     ranks.clear();
     for (size_t k = thread; k < slice.items.size(); k += threads) {
@@ -372,25 +384,27 @@ static void gatherRanks(ReadSlice &slice, unsigned int thread, unsigned int thre
     }
     SORT_SERIAL(ranks.begin(), ranks.end());
     ranks.erase(std::unique(ranks.begin(), ranks.end()), ranks.end());
-    if (thread == 0) {
-        slice.splitters.resize(threads - 1);
-        for (unsigned int t = 0; t + 1 < threads; t++) {
-            slice.splitters[t] = ranks.empty() ? 0 : ranks[ranks.size() * (t + 1) / threads];
-        }
+    std::vector<std::vector<uint64_t> > &dealt = slice.dealt[thread];
+    dealt.resize(threads);
+    for (unsigned int t = 0; t < threads; t++) {
+        dealt[t].clear();
+    }
+    Lin8DbReader::Cursor cursor;
+    for (size_t i = 0; i < ranks.size(); i++) {
+        uint32_t file = 0;
+        uint64_t offset = 0;
+        reader.locate(ranks[i], cursor, file, offset);
+        dealt[partOf(file, offset, threads)].push_back(ranks[i]);
     }
 }
 
-// merges this thread's rank range out of every gathered list and measures its reads
+// merges what every thread dealt to this part and measures its reads
 static void measurePart(const Lin8DbReader &reader, ReadSlice &slice, unsigned int thread) {
     SlicePart &part = slice.parts[thread];
     part.ranks.clear();
-    for (size_t g = 0; g < slice.gathered.size(); g++) {
-        const std::vector<uint64_t> &ranks = slice.gathered[g];
-        std::vector<uint64_t>::const_iterator from = thread == 0 ? ranks.begin()
-            : std::lower_bound(ranks.begin(), ranks.end(), slice.splitters[thread - 1]);
-        std::vector<uint64_t>::const_iterator until = thread == slice.parts.size() - 1 ? ranks.end()
-            : std::lower_bound(from, ranks.end(), slice.splitters[thread]);
-        part.ranks.insert(part.ranks.end(), from, until);
+    for (size_t g = 0; g < slice.dealt.size(); g++) {
+        const std::vector<uint64_t> &ranks = slice.dealt[g][thread];
+        part.ranks.insert(part.ranks.end(), ranks.begin(), ranks.end());
     }
     SORT_SERIAL(part.ranks.begin(), part.ranks.end());
     part.ranks.erase(std::unique(part.ranks.begin(), part.ranks.end()), part.ranks.end());
@@ -415,7 +429,7 @@ static void alignMemberBatch(const Lin8DbReader &reader, uint64_t rep,
                              int xDrop, std::vector<std::string> *lines) {
     const uint32_t queryLen = reader.getSeqLen(rep);
     std::string line;
-    const char *querySeq = slice.sequenceOf(rep);
+    const char *querySeq = slice.sequenceOf(reader, rep);
     query.mapSequence(0, 0, (char *) querySeq, queryLen);
     aligner.initQuery(&query);
     for (size_t k = 0; k < candidates.members.size(); k++) {
@@ -425,7 +439,7 @@ static void alignMemberBatch(const Lin8DbReader &reader, uint64_t rep,
             continue;
         }
         const uint32_t targetLen = reader.getSeqLen(member);
-        const char *targetSeq = slice.sequenceOf(member);
+        const char *targetSeq = slice.sequenceOf(reader, member);
         target.mapSequence(0, 0, (char *) targetSeq, targetLen);
         const BlockAligner::UngappedAln_res hit = aligner.ungappedAlign(
             &target, static_cast<unsigned short>(candidates.diagonals[k]));
@@ -561,6 +575,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
     ReadSlice slices[2];
     for (int i = 0; i < 2; i++) {
         slices[i].gathered.resize(threads);
+        slices[i].dealt.resize(threads);
         slices[i].parts.resize(threads);
     }
     std::vector<PairRecord> outBuffer;
@@ -723,7 +738,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                             collectCandidates(reader, batch[at].rep(), &batch[at + item.from], item.count,
                                               assignedCluster, par, slice.items[w - slice.firstItem], gate[thread]);
                         }
-                        gatherRanks(slice, thread, threads);
+                        gatherRanks(reader, slice, thread, threads);
 #pragma omp barrier
                         measurePart(reader, slice, thread);
 #pragma omp barrier
