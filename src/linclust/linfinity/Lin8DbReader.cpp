@@ -821,6 +821,10 @@ size_t Lin8DbReader::layoutReads(const uint64_t *ranks, size_t n, char *arena, s
     }
     Cursor cursor;
     size_t used = 0;
+    // the ranks are sorted, so a run of them lies in one chunk: that chunk is acquired once for the run
+    uint32_t runFile = 0;
+    uint64_t runChunk = ~uint64_t(0);
+    uint32_t runSlot = 0;
     for (size_t i = 0; i < n; i++) {
         cursor.at = index.rangeIndexFrom(ranks[i], cursor.at);
         const uint64_t offset = index.offsetInRange(cursor.at, ranks[i]);
@@ -832,6 +836,10 @@ size_t Lin8DbReader::layoutReads(const uint64_t *ranks, size_t n, char *arena, s
         const size_t inChunk = (size_t) (offset % ChunkCache::CHUNK);
         if (hold != NULL && length > 0 && inChunk + length <= ChunkCache::CHUNK) {
             const uint64_t chunk = offset / ChunkCache::CHUNK;
+            if (file == runFile && chunk == runChunk) {
+                at[i] = cache.memoryOf(runSlot) + inChunk;
+                continue;
+            }
             uint32_t slot = 0;
             ChunkCache::Outcome got = cache.acquire(file, chunk, slot);
             if (got == ChunkCache::PENDING) {
@@ -857,6 +865,9 @@ size_t Lin8DbReader::layoutReads(const uint64_t *ranks, size_t n, char *arena, s
                 keep.slot = slot;
                 keep.fill = got == ChunkCache::MISS;
                 hold->held.push_back(keep);
+                runFile = file;
+                runChunk = chunk;
+                runSlot = slot;
                 at[i] = cache.memoryOf(slot) + inChunk;
                 continue;
             }

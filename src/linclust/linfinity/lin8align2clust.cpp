@@ -31,7 +31,7 @@ static const size_t ARENA_BYTES = 1u << 20;
 
 static const size_t MEMBERS_PER_ALIGN_BATCH = 1024;
 // a batch is read in slices sorted by file position, the next one in flight while this one aligns
-static const size_t READ_SLICES = 8;
+static const size_t READ_SLICES = 2;
 static const size_t SLICE_MIN_ROWS = 1u << 16;
 // a slice's ranks go to the threads by the 1 MB stripe of the data they lie in, dealt round-robin:
 // the reads a slice needs cluster in the stretch of the file it has not seen yet, and a contiguous
@@ -510,7 +510,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
     }
     const unsigned int threads = par.threads;
     // a batch fills every lane four times over, so the fork and join are lost in the aligning
-    const size_t batchRows = (size_t) threads * Lin8DbReader::LANES * MEMBERS_PER_ALIGN_BATCH * 4;
+    const size_t batchRows = (size_t) threads * Lin8DbReader::LANES * MEMBERS_PER_ALIGN_BATCH * 8;
     Debug(Debug::INFO) << "Batches of " << batchRows << " rows\n";
     reader.openBatch(threads, ARENA_BYTES, Util::computeMemory(par.splitMemoryLimit),
                      Lin8DbReader::READ_AGAIN, Lin8DbReader::ACCESS_RANDOM, par.lin8ReadCache);
