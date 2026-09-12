@@ -178,6 +178,7 @@ struct SlicePart {
     std::vector<const char *> at;
     std::vector<IoRing::Read> reads;
     size_t bytes;
+    std::vector<char> arena;
 };
 
 // the rows of one slice and every sequence they need, read once in file order
@@ -188,8 +189,6 @@ struct ReadSlice {
     std::vector<std::vector<uint64_t> > gathered;
     std::vector<std::vector<std::vector<uint64_t> > > dealt;   // [gathering thread][part]
     std::vector<SlicePart> parts;
-    std::vector<size_t> partOffset;
-    std::vector<char> arena;
 
     const char *sequenceOf(const Lin8DbReader &reader, uint64_t rank) const {
         uint32_t file = 0;
@@ -371,10 +370,11 @@ static void collectCandidates(const Lin8DbReader &reader, uint64_t rep, const Pa
 }
 
 // each thread sorts the ranks of every threads-th item and deals them to the parts by stripe
-static void gatherRanks(const Lin8DbReader &reader, ReadSlice &slice, unsigned int thread, unsigned int threads) {
+static void gatherRanks(const Lin8DbReader &reader, ReadSlice &slice, unsigned int thread, unsigned int threads,
+                        size_t count) {
     std::vector<uint64_t> &ranks = slice.gathered[thread];
     ranks.clear();
-    for (size_t k = thread; k < slice.items.size(); k += threads) {
+    for (size_t k = thread; k < count; k += threads) {
         const Candidates &item = slice.items[k];
         if (item.members.empty()) {
             continue;
@@ -409,17 +409,6 @@ static void measurePart(const Lin8DbReader &reader, ReadSlice &slice, unsigned i
     SORT_SERIAL(part.ranks.begin(), part.ranks.end());
     part.ranks.erase(std::unique(part.ranks.begin(), part.ranks.end()), part.ranks.end());
     part.bytes = reader.layoutReads(part.ranks.data(), part.ranks.size(), NULL, part.reads, part.at, thread, 0);
-}
-
-static void placeParts(ReadSlice &slice) {
-    slice.partOffset.resize(slice.parts.size() + 1);
-    slice.partOffset[0] = 0;
-    for (size_t t = 0; t < slice.parts.size(); t++) {
-        slice.partOffset[t + 1] = slice.partOffset[t] + slice.parts[t].bytes;
-    }
-    if (slice.arena.size() < slice.partOffset.back()) {
-        slice.arena.resize(slice.partOffset.back());
-    }
 }
 
 static void alignMemberBatch(const Lin8DbReader &reader, uint64_t rep,
@@ -709,6 +698,12 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
             const size_t slicesWanted = std::max<size_t>(1, std::min(READ_SLICES, batch.size() / SLICE_MIN_ROWS));
             const size_t sliceItems = (work.size() + slicesWanted - 1) / slicesWanted;
             const size_t sliceCount = sliceItems == 0 ? 0 : (work.size() + sliceItems - 1) / sliceItems;
+            // sized once a batch, so no thread waits for a single to size them a slice
+            for (int i = 0; i < 2; i++) {
+                if (slices[i].items.size() < sliceItems) {
+                    slices[i].items.resize(sliceItems);
+                }
+            }
 #pragma omp parallel num_threads(threads)
             {
                 unsigned int thread = 0;
@@ -725,28 +720,29 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                     double waited = 0;
                     if (s < sliceCount) {
                         ReadSlice &slice = slices[s % 2];
-#pragma omp single
-                        {
-                            slice.firstItem = s * sliceItems;
-                            slice.lastItem = std::min(work.size(), slice.firstItem + sliceItems);
-                            slice.items.resize(slice.lastItem - slice.firstItem);
+                        // every thread derives the bounds itself and collects the items it will gather, its
+                        // every threads-th one, so neither a single nor a barrier sits between the two
+                        const size_t firstItem = s * sliceItems;
+                        const size_t lastItem = std::min(work.size(), firstItem + sliceItems);
+                        if (thread == 0) {
+                            slice.firstItem = firstItem;
+                            slice.lastItem = lastItem;
                         }
-#pragma omp for schedule(dynamic, 16)
-                        for (size_t w = slice.firstItem; w < slice.lastItem; w++) {
-                            const MemberBatch &item = work[w];
+                        for (size_t k = thread; k < lastItem - firstItem; k += threads) {
+                            const MemberBatch &item = work[firstItem + k];
                             const size_t at = starts[item.group];
                             collectCandidates(reader, batch[at].rep(), &batch[at + item.from], item.count,
-                                              assignedCluster, par, slice.items[w - slice.firstItem], gate[thread]);
+                                              assignedCluster, par, slice.items[k], gate[thread]);
                         }
-                        gatherRanks(reader, slice, thread, threads);
+                        gatherRanks(reader, slice, thread, threads, lastItem - firstItem);
 #pragma omp barrier
-                        measurePart(reader, slice, thread);
-#pragma omp barrier
-#pragma omp single
-                        placeParts(slice);
+                        // from here the part is this thread's alone: measured, sized and laid out on its own
                         SlicePart &part = slice.parts[thread];
-                        reader.layoutReads(part.ranks.data(), part.ranks.size(),
-                                           slice.arena.data() + slice.partOffset[thread], part.reads, part.at,
+                        measurePart(reader, slice, thread);
+                        if (part.arena.size() < part.bytes) {
+                            part.arena.resize(part.bytes);
+                        }
+                        reader.layoutReads(part.ranks.data(), part.ranks.size(), part.arena.data(), part.reads, part.at,
                                            thread, s % 2);
                         reader.submitReads(thread, s % 2, part.reads.data(), part.reads.size());
                     }
