@@ -39,6 +39,8 @@ static const size_t SLICE_MIN_ROWS = 1u << 16;
 // reads still merge within a stripe.
 static const uint64_t PART_STRIPE = 1u << 20;
 
+static_assert(PART_STRIPE % (64u << 10) == 0, "a chunk must not straddle two parts");
+
 static unsigned int partOf(uint32_t file, uint64_t offset, size_t parts) {
     return static_cast<unsigned int>((offset / PART_STRIPE + (uint64_t) file * 7919u) % parts);
 }
@@ -718,6 +720,13 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                 for (size_t s = 0; s <= sliceCount; s++) {
                     const double began = omp_get_wtime();
                     double waited = 0;
+                    // the last slice's reads first: the chunks they filled are then hits for this
+                    // slice's layout, and the barrier below is the only one its aligning needs
+                    if (s > 0) {
+                        const double stalled = omp_get_wtime();
+                        reader.awaitBatch(thread, (s - 1) % 2);
+                        waited = omp_get_wtime() - stalled;
+                    }
                     if (s < sliceCount) {
                         ReadSlice &slice = slices[s % 2];
                         // every thread derives the bounds itself and collects the items it will gather, its
@@ -735,7 +744,10 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                                               assignedCluster, par, slice.items[k], gate[thread]);
                         }
                         gatherRanks(reader, slice, thread, threads, lastItem - firstItem);
+                    }
 #pragma omp barrier
+                    if (s < sliceCount) {
+                        ReadSlice &slice = slices[s % 2];
                         // from here the part is this thread's alone: measured, sized and laid out on its own
                         SlicePart &part = slice.parts[thread];
                         measurePart(reader, slice, thread);
@@ -748,10 +760,6 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                     }
                     if (s > 0) {
                         ReadSlice &slice = slices[(s - 1) % 2];
-                        const double stalled = omp_get_wtime();
-                        reader.awaitBatch(thread, (s - 1) % 2);
-#pragma omp barrier
-                        waited = omp_get_wtime() - stalled;
 #pragma omp for schedule(dynamic, 1)
                         for (size_t w = slice.firstItem; w < slice.lastItem; w++) {
                             const Candidates &item = slice.items[w - slice.firstItem];
