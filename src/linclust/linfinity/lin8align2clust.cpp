@@ -39,7 +39,7 @@ static const size_t SLICE_MIN_ROWS = 1u << 16;
 // reads still merge within a stripe.
 static const uint64_t PART_STRIPE = 1u << 20;
 
-static_assert(PART_STRIPE % (64u << 10) == 0, "a chunk must not straddle two parts");
+static_assert(PART_STRIPE % ChunkCache::CHUNK == 0, "a chunk must not straddle two parts");
 
 static unsigned int partOf(uint32_t file, uint64_t offset, size_t parts) {
     return static_cast<unsigned int>((offset / PART_STRIPE + (uint64_t) file * 7919u) % parts);

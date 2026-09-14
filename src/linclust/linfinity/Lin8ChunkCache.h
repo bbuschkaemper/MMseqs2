@@ -9,17 +9,20 @@
 #endif
 
 // Fixed-size file chunks the reader keeps itself, for a filesystem whose page cache does not.
-// Two-way set associative: a chunk lives in one of two slots picked by its hash, a used bit
-// gives a slot a second chance before it is taken. A caller acquires a chunk, which pins it,
-// fills it after a MISS, and releases it after copying out. Nothing waits: a chunk still
-// being filled comes back PENDING, pinned, for the caller to keep only if the fill is its own,
-// and a pair with both slots pinned answers BUSY.
+// Set associative, WAYS slots to a set picked by the chunk's hash; the victim is the set's least
+// recently acquired slot that no one holds, so a chunk the current slices keep coming back to is
+// not thrown out for one that arrived later. A caller acquires a chunk, which pins it, fills it
+// after a MISS, and releases it after copying or aligning out of it. Nothing waits: a chunk still
+// being filled comes back PENDING, pinned, and a set with every slot pinned answers BUSY.
 class ChunkCache {
 public:
-    static const size_t CHUNK = 64u << 10;
+    // one megabyte: what a parallel file system reads well in one go, sixteen times fewer
+    // sequences cut in two by a chunk edge than at 64 KB, and sixteen times fewer acquires
+    static const size_t CHUNK = 1u << 20;
+    static const unsigned WAYS = 8;
     enum Outcome { HIT, MISS, PENDING, BUSY };
 
-    ChunkCache() : bytes(NULL), hits(0), misses(0), busy(0) {}
+    ChunkCache() : bytes(NULL), tick(0), hits(0), misses(0), busy(0) {}
     ~ChunkCache() { close(); }
 
     bool open(size_t wanted);
@@ -38,15 +41,17 @@ private:
     enum State { EMPTY, FILLING, READY };
     struct Slot {
         uint64_t key;
+        uint32_t stamp;
         uint32_t pins;
-        uint8_t state, used;
+        uint8_t state;
     };
-    static const unsigned STRIPES = 256;
+    static const unsigned STRIPES = 4096;
 
     void lock(uint32_t slot);
     void unlock(uint32_t slot);
 
     char *bytes;
+    uint32_t tick;
     std::vector<Slot> slots;
 #ifdef OPENMP
     omp_lock_t locks[STRIPES];
