@@ -584,7 +584,11 @@ uint64_t Lin8DbReader::countKept() const {
 }
 
 Lin8DbReader::HeaderStream::HeaderStream(const Lin8DbReader &owner)
-    : owner(owner), range(0), left(0), at(0), frameFile(0), frame(0) {
+    : HeaderStream(owner, 0, owner.index.rangeCount()) {}
+
+Lin8DbReader::HeaderStream::HeaderStream(const Lin8DbReader &owner, size_t firstRange, size_t endRange)
+    : owner(owner), range(firstRange), until(std::min(endRange, owner.index.rangeCount())),
+      left(0), at(0), frameFile(0), frame(0) {
     if (owner.headers.empty()) {
         Debug(Debug::ERROR) << "Headers of " << owner.db << " were not opened\n";
         EXIT(EXIT_FAILURE);
@@ -619,7 +623,7 @@ const char *Lin8DbReader::HeaderStream::frameText(uint32_t file, size_t &avail) 
 
 bool Lin8DbReader::HeaderStream::next(const char *&begin, size_t &length) {
     while (left == 0) {
-        if (range >= owner.index.rangeCount()) {
+        if (range >= until) {
             return false;
         }
         left = owner.index.rankAfter(range) - owner.index[range].firstRank();

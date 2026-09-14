@@ -6,6 +6,7 @@
 #include "Util.h"
 #include "Timer.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -31,21 +32,26 @@ static const uint64_t NAME_CHUNK = uint64_t(1) << NAME_CHUNK_BITS;
 struct PackedNames {
     std::vector<std::vector<char> > chunk;
     std::vector<uint64_t> at;
-    uint64_t end;
-    PackedNames(size_t ranks) : at(ranks + 1, 0), end(0) {}
+    PackedNames(size_t ranks) : at(ranks + 1, 0) {}
 
-    void append(const char *name, size_t length) {
-        uint64_t wrote = 0;
+    // room for total bytes of names, so that threads can place theirs side by side
+    void reserve(uint64_t total, unsigned int threads) {
+        chunk.resize((size_t) ((total + NAME_CHUNK - 1) >> NAME_CHUNK_BITS));
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+        for (size_t which = 0; which < chunk.size(); which++) {
+            std::vector<char>(NAME_CHUNK).swap(chunk[which]);
+        }
+    }
+
+    void place(uint64_t at, const char *name, size_t length) {
+        size_t wrote = 0;
         while (wrote < length) {
-            const size_t which = (size_t) (end >> NAME_CHUNK_BITS);
-            if (which >= chunk.size()) {
-                chunk.push_back(std::vector<char>(NAME_CHUNK));
-            }
-            const size_t off = (size_t) (end & (NAME_CHUNK - 1));
+            const size_t which = (size_t) (at >> NAME_CHUNK_BITS);
+            const size_t off = (size_t) (at & (NAME_CHUNK - 1));
             const size_t take = std::min<uint64_t>(length - wrote, NAME_CHUNK - off);
             memcpy(&chunk[which][off], name + wrote, take);
             wrote += take;
-            end += take;
+            at += take;
         }
     }
 
@@ -64,6 +70,20 @@ struct PackedNames {
     size_t lengthOf(uint64_t rank) const { return (size_t) (at[rank + 1] - at[rank]); }
     size_t bytes() const { return chunk.size() * NAME_CHUNK + at.size() * sizeof(uint64_t); }
 };
+
+// the name Util::parseFastaHeader cuts from a header line, without a string per header: the scratch
+// string keeps its room from one line to the next
+static size_t nameOf(const char *header, std::string &scratch, const char *&name) {
+    const size_t length = Util::skipNoneWhitespace(header);
+    scratch.assign(header, length);
+    const std::pair<ssize_t, ssize_t> pos = Util::getFastaHeaderPosition(scratch);
+    if (pos.first == -1 && pos.second == -1) {
+        name = header;
+        return 0;
+    }
+    name = header + pos.first;
+    return (size_t) (pos.second - pos.first);
+}
 
 int lin8createtsv(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
@@ -87,46 +107,65 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
     Timer timer;
     const unsigned int threads = std::max<unsigned int>(1, par.threads);
     PackedNames nameOfRank(reader.getSize());
-    const size_t NAME_BATCH = 1u << 16;
-    std::vector<std::string> parsed(NAME_BATCH);
-    Lin8DbReader::HeaderStream headers(reader);
+    // a length range is a run of headers a stream can start at on its own, so the ranges are the
+    // units of work: a first pass measures the names of every range, a prefix sum places the ranges,
+    // and a second pass parses again and writes each name where it belongs. Largest ranges first
+    // keeps the threads even, one thread streaming a header at a time kept all the others waiting
+    const Lin8DbIndex &index = reader.getIndex();
+    const size_t rangeCount = index.rangeCount();
+    std::vector<size_t> order(rangeCount);
+    for (size_t r = 0; r < rangeCount; r++) {
+        order[r] = r;
+    }
+    std::sort(order.begin(), order.end(), [&index](size_t a, size_t b) {
+        return index.rankAfter(a) - index[a].firstRank() > index.rankAfter(b) - index[b].firstRank();
+    });
+    std::vector<uint64_t> startOfRange(rangeCount + 1, 0);
     Debug(Debug::INFO) << "Naming " << reader.getSize() << " sequences\n";
-    Debug::Progress nameProgress(reader.getSize() / NAME_BATCH + 1);
-    const char *begin = NULL;
-    size_t length = 0;
-    uint64_t rank = 0;
-    while (true) {
-        size_t got = 0;
-        while (got < NAME_BATCH && headers.next(begin, length)) {
-            if (rank + got >= reader.getSize()) {
-                Debug(Debug::ERROR) << "The headers hold more entries than the " << reader.getSize()
-                                    << " the index names\n";
-                EXIT(EXIT_FAILURE);
+    for (int pass = 0; pass < 2; pass++) {
+        Debug::Progress nameProgress(rangeCount);
+#pragma omp parallel num_threads(threads)
+        {
+            std::string scratch;
+            const char *begin = NULL;
+            size_t length = 0;
+#pragma omp for schedule(dynamic, 1)
+            for (size_t k = 0; k < rangeCount; k++) {
+                const size_t r = order[k];
+                Lin8DbReader::HeaderStream headers(reader, r, r + 1);
+                uint64_t rank = index[r].firstRank();
+                uint64_t at = pass == 0 ? 0 : startOfRange[r];
+                while (headers.next(begin, length)) {
+                    const char *name = NULL;
+                    const size_t nameLength = nameOf(begin, scratch, name);
+                    if (pass == 1) {
+                        nameOfRank.at[rank] = at;
+                        nameOfRank.place(at, name, nameLength);
+                    }
+                    at += nameLength;
+                    rank++;
+                }
+                if (rank != index.rankAfter(r)) {
+                    Debug(Debug::ERROR) << "The headers of length range " << r << " hold "
+                                        << (rank - index[r].firstRank()) << " entries and the index names "
+                                        << (index.rankAfter(r) - index[r].firstRank()) << "\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                if (pass == 0) {
+                    startOfRange[r + 1] = at;
+                }
+                nameProgress.updateProgress();
             }
-            parsed[got].assign(begin, length);
-            got++;
         }
-        if (got == 0) {
-            break;
+        if (pass == 0) {
+            for (size_t r = 0; r < rangeCount; r++) {
+                startOfRange[r + 1] += startOfRange[r];
+            }
+            nameOfRank.reserve(startOfRange[rangeCount], threads);
         }
-        nameProgress.updateProgress();
-#pragma omp parallel for schedule(static) num_threads(threads)
-        for (size_t i = 0; i < got; i++) {
-            parsed[i] = Util::parseFastaHeader(parsed[i].c_str());
-        }
-        for (size_t i = 0; i < got; i++) {
-            nameOfRank.at[rank + i] = nameOfRank.end;
-            nameOfRank.append(parsed[i].data(), parsed[i].size());
-        }
-        rank += got;
     }
-    if (rank != reader.getSize()) {
-        Debug(Debug::ERROR) << "The headers hold " << rank << " entries and the index names "
-                            << reader.getSize() << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    nameOfRank.at[reader.getSize()] = nameOfRank.end;
-    Debug(Debug::INFO) << "Read " << rank << " names in " << timer.lap() << ", " << (nameOfRank.bytes() >> 30) << " GB\n";
+    nameOfRank.at[reader.getSize()] = startOfRange[rangeCount];
+    Debug(Debug::INFO) << "Read " << reader.getSize() << " names in " << timer.lap() << ", " << (nameOfRank.bytes() >> 30) << " GB\n";
 
     DBReader<DBKeyType> clusters(par.db2.c_str(), par.db2Index.c_str(), par.threads,
                                  DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);

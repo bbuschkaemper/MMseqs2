@@ -137,12 +137,15 @@ public:
     class HeaderStream {
     public:
         HeaderStream(const Lin8DbReader &owner);
+        // only the length ranges firstRange up to endRange, so threads can stream side by side
+        HeaderStream(const Lin8DbReader &owner, size_t firstRange, size_t endRange);
         // begin stays kept only until the next call
         bool next(const char *&begin, size_t &length);
     private:
         const char *frameText(uint32_t file, size_t &avail);
         const Lin8DbReader &owner;
         size_t range;
+        size_t until;
         uint64_t left;
         size_t at;
         uint32_t frameFile;
