@@ -31,7 +31,8 @@ struct IoRing {
     bool open(unsigned depth);
     bool isOpen() const { return ready; }
 
-    std::vector<Read> &list() { return reads; }
+    // joins a helper still reading the last list, so the caller may change it
+    std::vector<Read> &list();
     void submit(const char *what);
     void await(const char *what);
 
@@ -46,6 +47,8 @@ private:
     // without a ring (io_uring disabled, as on JURECA) a helper thread does the reads, so submit
     // still returns at once and the reads overlap with what the caller does until await
     std::thread helper;
+    // what the helper could not read; the thread that awaits reports it, not the helper
+    std::string helperError;
     std::vector<Read> reads;
     size_t queued;
     size_t done;

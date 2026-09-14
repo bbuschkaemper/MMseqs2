@@ -164,18 +164,24 @@ void IoRing::preadAll(const char *what) {
                 break;
             }
             if (n < 0) {
-                Debug(Debug::ERROR) << "Cannot read " << reads[i].length << " byte from " << what
-                                    << " at " << reads[i].offset << "\n";
-                EXIT(EXIT_FAILURE);
+                helperError = "Cannot read " + SSTR(reads[i].length) + " byte from " + what + " at "
+                              + SSTR(reads[i].offset) + ": " + strerror(errno);
+                return;
             }
             got += static_cast<size_t>(n);
         }
         if (got < reads[i].required) {
-            Debug(Debug::ERROR) << "Short read of " << got << " byte from " << what << " at "
-                                << reads[i].offset << "\n";
-            EXIT(EXIT_FAILURE);
+            helperError = "Short read of " + SSTR(got) + " byte from " + what + " at " + SSTR(reads[i].offset);
+            return;
         }
     }
+}
+
+std::vector<IoRing::Read> &IoRing::list() {
+    if (helper.joinable()) {
+        helper.join();
+    }
+    return reads;
 }
 
 void IoRing::pump(const char *what, bool untilDone) {
@@ -269,6 +275,10 @@ void IoRing::await(const char *what) {
     if (helper.joinable()) {
         helper.join();
         done = reads.size();
+        if (helperError.empty() == false) {
+            Debug(Debug::ERROR) << helperError << "\n";
+            EXIT(EXIT_FAILURE);
+        }
     }
     if (done >= reads.size()) {
         return;
@@ -405,6 +415,10 @@ void Lin8DbReader::open() {
 }
 
 void Lin8DbReader::close() {
+    for (size_t i = 0; i < batch.size(); i++) {
+        delete batch[i];
+    }
+    batch.clear();
     if (useCache) {
         Debug(Debug::INFO) << "Chunk cache: " << cache.hits << " hits, " << cache.misses << " misses ("
                            << ((cache.misses * ChunkCache::CHUNK) >> 30) << " GB read), " << cache.busy
@@ -418,10 +432,6 @@ void Lin8DbReader::close() {
         kept = NULL;
         keptLoaded = false;
     }
-    for (size_t i = 0; i < batch.size(); i++) {
-        delete batch[i];
-    }
-    batch.clear();
     for (size_t i = 0; i < directFd.size(); i++) {
         if (directFd[i] >= 0) {
             ::close(directFd[i]);
@@ -821,6 +831,8 @@ size_t Lin8DbReader::layoutReads(const uint64_t *ranks, size_t n, char *arena, s
     }
     Cursor cursor;
     size_t used = 0;
+    // the last read into the arena, which a following one may grow; a chunk read went elsewhere
+    size_t lastDirect = ~size_t(0);
     // the ranks are sorted, so a run of them lies in one chunk: that chunk is acquired once for the run
     uint32_t runFile = 0;
     uint64_t runChunk = ~uint64_t(0);
@@ -843,13 +855,10 @@ size_t Lin8DbReader::layoutReads(const uint64_t *ranks, size_t n, char *arena, s
             uint32_t slot = 0;
             ChunkCache::Outcome got = cache.acquire(file, chunk, slot);
             if (got == ChunkCache::PENDING) {
-                // a chunk this lane is itself filling has landed by the time the slice is aligned
-                if (hold->held.empty() == false && hold->held.back().slot == slot) {
-                    got = ChunkCache::HIT;
-                } else {
-                    cache.release(slot, false);
-                    got = ChunkCache::BUSY;
-                }
+                // still being filled by another lane: the last slice's reads are awaited before this
+                // layout, so this is rare, and the sequence is read directly rather than waited for
+                cache.release(slot, false);
+                got = ChunkCache::BUSY;
             }
             if (got != ChunkCache::BUSY) {
                 if (got == ChunkCache::MISS) {
@@ -874,11 +883,11 @@ size_t Lin8DbReader::layoutReads(const uint64_t *ranks, size_t n, char *arena, s
         }
         const uint64_t blockFrom = offset - offset % DIRECT_BLOCK;
         const uint64_t blockUntil = ((offset + length + DIRECT_BLOCK - 1) / DIRECT_BLOCK) * DIRECT_BLOCK;
-        // only a read that ends where the arena ends can grow; a chunk read went into the cache
-        if (reads.empty() == false && reads.back().fd == fd && reads.back().offset <= blockFrom
-            && blockFrom <= reads.back().offset + reads.back().length
-            && static_cast<char *>(reads.back().into) + reads.back().length == aligned + used) {
-            IoRing::Read &last = reads.back();
+        // only the last read into the arena can grow, so the measure, which lays every rank out
+        // directly, is an upper bound on what the arena needs
+        if (lastDirect < reads.size() && reads[lastDirect].fd == fd && reads[lastDirect].offset <= blockFrom
+            && blockFrom <= reads[lastDirect].offset + reads[lastDirect].length) {
+            IoRing::Read &last = reads[lastDirect];
             const uint64_t end = last.offset + last.length;
             if (blockUntil > end) {
                 last.length += (size_t) (blockUntil - end);
@@ -895,6 +904,7 @@ size_t Lin8DbReader::layoutReads(const uint64_t *ranks, size_t n, char *arena, s
         read.length = (size_t) (blockUntil - blockFrom);
         read.required = (size_t) (offset + length - blockFrom);
         reads.push_back(read);
+        lastDirect = reads.size() - 1;
         at[i] = aligned + used + (size_t) (offset - blockFrom);
         used += read.length;
     }
