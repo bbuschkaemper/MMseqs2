@@ -130,7 +130,7 @@ bool readNode(NodeSample &node) {
     return true;
 }
 
-bool readProcess(pid_t pid, ProcessSample &sample) {
+bool readProcess(pid_t pid, ProcessSample &sample, bool withIo = true) {
     std::string text;
     if (readWhole("/proc/" + SSTR(pid) + "/stat", text) == false) {
         return false;
@@ -157,7 +157,7 @@ bool readProcess(pid_t pid, ProcessSample &sample) {
     sample.cpuTicks = utime + stime;
     sample.rssBytes = (unsigned long long) rssPages * (unsigned long long) sysconf(_SC_PAGESIZE);
     sample.readChars = sample.writeChars = sample.readBytes = sample.writeBytes = 0;
-    if (readWhole("/proc/" + SSTR(pid) + "/io", text)) {
+    if (withIo && readWhole("/proc/" + SSTR(pid) + "/io", text)) {
         const char *at;
         if ((at = strstr(text.c_str(), "rchar:")) != NULL) sscanf(at, "rchar: %llu", &sample.readChars);
         if ((at = strstr(text.c_str(), "wchar:")) != NULL) sscanf(at, "wchar: %llu", &sample.writeChars);
@@ -202,7 +202,7 @@ void readTree(pid_t root, std::map<pid_t, ProcessSample> &tree, std::set<std::st
         }
         const pid_t pid = (pid_t) atol(entry->d_name);
         ProcessSample sample;
-        if (readProcess(pid, sample)) {
+        if (readProcess(pid, sample, false)) {
             all[pid] = sample;
         }
     }
@@ -225,8 +225,12 @@ void readTree(pid_t root, std::map<pid_t, ProcessSample> &tree, std::set<std::st
         if (pid == self) {
             continue;
         }
-        tree[pid] = me->second;
-        const std::string &name = me->second.command;
+        // Refresh in parent-before-child order. Reading a reaped child's former
+        // parent after the child would count its transferred I/O twice.
+        ProcessSample current;
+        if (!readProcess(pid, current)) continue;
+        tree[pid] = current;
+        const std::string &name = current.command;
         if (pid != root && name != rootName && name != "sh" && name != "bash" && name != "sleep") {
             const std::string phase = phaseName(pid, name);
             if (phase.empty() == false) {
@@ -293,7 +297,7 @@ int lin8monitor(int argc, const char **argv, const Command &command) {
     const time_t started = time(NULL);
     NodeSample node;
     readNode(node);
-    fprintf(out, "# lin8-monitor host=%s cpus=%ld mem_total_gb=%.1f pid=%d interval_s=%d %s=%s\n", host, cpus,
+    fprintf(out, "# lin8-monitor host=%s cpus=%ld mem_total_gb=%.1f pid=%d interval_s=%d %s=%s io_accounting=tree_high_water\n", host, cpus,
             gb(node.memTotal), (int) root, interval, fresh ? "started" : "resumed", isoTime(started).c_str());
     if (fresh) {
         fprintf(out, "time\telapsed_s\tphase\tnode_cpu_cores\ttree_cpu_cores\tnode_mem_used_gb\ttree_rss_gb\t"
@@ -305,6 +309,12 @@ int lin8monitor(int argc, const char **argv, const Command &command) {
     std::map<pid_t, ProcessSample> previousTree;
     std::set<std::string> phases;
     readTree(root, previousTree, phases);
+    unsigned long long ioHigh[4] = {0, 0, 0, 0};
+    for (const auto &entry : previousTree) {
+        const ProcessSample &s = entry.second;
+        ioHigh[0] += s.readChars; ioHigh[1] += s.writeChars;
+        ioHigh[2] += s.readBytes; ioHigh[3] += s.writeBytes;
+    }
     time_t previousTime = started;
     unsigned long long peakRss = 0;
     double totalCpuSeconds = 0;
@@ -333,10 +343,20 @@ int lin8monitor(int argc, const char **argv, const Command &command) {
             const ProcessSample zero = {0, "", 0, 0, 0, 0, 0, 0};
             const ProcessSample &p = (before == previousTree.end()) ? zero : before->second;
             cpuTicks += s.cpuTicks - std::min(s.cpuTicks, p.cpuTicks);
-            readChars += s.readChars - std::min(s.readChars, p.readChars);
-            writeChars += s.writeChars - std::min(s.writeChars, p.writeChars);
-            readBytes += s.readBytes - std::min(s.readBytes, p.readBytes);
-            writeBytes += s.writeBytes - std::min(s.writeBytes, p.writeBytes);
+            readChars += s.readChars;
+            writeChars += s.writeChars;
+            readBytes += s.readBytes;
+            writeBytes += s.writeBytes;
+        }
+        // A child's I/O moves to its parent on wait(). Sum first, then take the
+        // delta; a high-water mark bridges a child disappearing during sampling
+        // before its parent's transferred counters become visible. Phase timing
+        // still has interval-sized uncertainty, and detached children are lost.
+        unsigned long long *ioNow[4] = {&readChars, &writeChars, &readBytes, &writeBytes};
+        for (size_t i = 0; i < 4; i++) {
+            const unsigned long long total = *ioNow[i];
+            *ioNow[i] = total - std::min(total, ioHigh[i]);
+            ioHigh[i] = std::max(ioHigh[i], total);
         }
         peakRss = std::max(peakRss, rss);
         const double cpuSeconds = (double) cpuTicks / ticksPerSecond;

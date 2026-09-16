@@ -328,7 +328,7 @@ static uint64_t extractAndWriteChunkKmers(const Lin8DbReader &dbReader, const Ex
                          const unsigned char *residueToClass, unsigned int kmerLength,
                          unsigned int residueClassCount, unsigned int baseKmersPerSequence, float kmersPerResidue,
                          unsigned int threadCount,
-                         std::vector<std::vector<uint64_t> > &subBucketCountsByThread) {
+                         std::vector<std::vector<uint64_t> > &subBucketCountsByThread, Lin8Profile *profile) {
     const size_t bucketCount = KmerRecord::BUCKET_COUNT;
     uint64_t emittedRecordCount = 0;
 #pragma omp parallel num_threads(threadCount) reduction(+ : emittedRecordCount)
@@ -359,11 +359,16 @@ static uint64_t extractAndWriteChunkKmers(const Lin8DbReader &dbReader, const Ex
                 if (ranksToRead.empty()) {
                     break;
                 }
+                Lin8Profile::Scope read(profile, Lin8Profile::EXTRACT_READ);
                 const size_t loadedRankCount = 1 + dbReader.startBatch(ranksToRead[0], ranksToRead.data() + 1, ranksToRead.size() - 1, threadIdx, 0);
                 if (loadedRankCount < ranksToRead.size()) {
                     nextRank = ranksToRead[loadedRankCount];
                 }
                 dbReader.awaitBatch(threadIdx, 0);
+                read.stop();
+                // Time batches, not individual sequences. Writer scopes below
+                // expose the nested routing/sort/encode/I/O work separately.
+                Lin8Profile::Scope select(profile, Lin8Profile::EXTRACT_SELECT, false, 0, loadedRankCount);
                 for (size_t sequenceIndexInBatch = 0; sequenceIndexInBatch < loadedRankCount; sequenceIndexInBatch++) {
                     const uint64_t rank = ranksToRead[sequenceIndexInBatch];
                     const uint32_t length = dbReader.getSeqLen(rank, dbCursor);
@@ -440,6 +445,8 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
     FileUtil::fixRlimitNoFile();
 
     const NodePlacement node = NodePlacement::resolve(par);
+    Lin8Profile profile("extractkmers", par.threads);
+    Lin8Profile::Scope total(&profile, Lin8Profile::TOTAL, true);
     Lin8DbReader reader(par.db1);
     reader.open();
     configureKmerParameters(par, reader.getDataSize());
@@ -499,7 +506,7 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
     const KmerSegmentCodec codec(bitsFor(reader.getSize()), reducedAlphabetSize);
     BucketWriter<KmerRecord, SegmentEncoder<KmerSegmentCodec> > writer(nodeBucketFilePrefix, KmerRecord::BUCKET_COUNT, par.threads,
                                     workingMemoryBudgetBytes - (size_t) par.threads * BATCH_READ_ARENA_BYTES,
-                                    SegmentEncoder<KmerSegmentCodec>(codec));
+                                    SegmentEncoder<KmerSegmentCodec>(codec, &profile), &profile);
     writer.openAt(existingBytesPerBucket, existingIndexBytesPerBucket);
     uint64_t writtenRecordCount = 0;
     Debug::Progress progress(extractionChunks.size() - firstUnprocessedChunk);
@@ -508,15 +515,20 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
     double extractionSeconds = 0, checkpointFlushSeconds = 0;
     writer.resetCounts();
     for (size_t at = firstUnprocessedChunk; at < extractionChunks.size(); at++) {
+        Lin8Profile::Scope chunkWork(&profile, Lin8Profile::BUCKET, true, 0,
+                                    extractionChunks[at].endRankExclusive - extractionChunks[at].firstRank, at);
         double phaseStartTime = omp_get_wtime();
         pendingCheckpointRecordCount += extractAndWriteChunkKmers(reader, extractionChunks[at], writer, letterToCode.data(), par.kmerSize,
                                        validResidueClassCount, baseKmersPerSequence,
                                        par.kmersPerSequenceScale.values.aminoacid(),
-                                       par.threads, pendingSubBucketCountsByThread);
+                                       par.threads, pendingSubBucketCountsByThread, &profile);
         extractionSeconds += omp_get_wtime() - phaseStartTime;
         if (pendingCheckpointRecordCount * KmerRecord::DISK_BYTES >= CHECKPOINT_BYTE_LIMIT || at + 1 == extractionChunks.size()) {
+            Lin8Profile::Scope checkpoint(&profile, Lin8Profile::CHECKPOINT, true, 0,
+                                         pendingCheckpointRecordCount, checkpointIndex);
             phaseStartTime = omp_get_wtime();
             writer.finishChunk(par.threads);
+            Lin8Profile::Scope metadata(&profile, Lin8Profile::METADATA, true);
             writeBucketManifest(checkpointManifestPath(par.db2, node.index, checkpointIndex) + ".manifest",
                                 writer.chunkCounts(), writer.chunkBytes(), writer.chunkIndexBytes(), "chunk",
                                 checkpointFirstChunk, at + 1);
@@ -553,6 +565,8 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
                        << "s\n";
     Debug(Debug::INFO) << "Wrote " << writtenRecordCount << " k-mer records in " << timer.lap() << "\n";
     reader.close();
+    total.stop();
+    profile.report();
     return EXIT_SUCCESS;
 }
 
@@ -689,6 +703,8 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
 
     FileUtil::fixRlimitNoFile();
     const NodePlacement node = NodePlacement::resolve(par);
+    Lin8Profile profile("assignedpairs", par.threads);
+    Lin8Profile::Scope total(&profile, Lin8Profile::TOTAL, true);
     Lin8DbReader reader(par.db1);
     reader.open();
     unsigned int writerNodes = 0;
@@ -758,7 +774,7 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
     const size_t forReading = std::min<size_t>((size_t) largestBucket * sizeof(KmerRecord), budget / 2);
     const PairSegmentCodec codec(bitsFor(ranks), ranks, repRankBlockCount);
     BucketWriter<PairRecord, SegmentEncoder<PairSegmentCodec> > writer(prefix, repRankBlockCount, par.threads, budget - forReading,
-                                                               SegmentEncoder<PairSegmentCodec>(codec));
+                                                               SegmentEncoder<PairSegmentCodec>(codec, &profile), &profile);
     writer.openAt(keep, keepIndex);
 
     Debug::Progress progress(myBuckets);
@@ -772,6 +788,7 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
     double spentReading = 0, spentGrouping = 0, spentWriting = 0;
     writer.resetCounts();
     for (size_t bucket = first; bucket < buckets; bucket += node.count) {
+        Lin8Profile::Scope bucketWork(&profile, Lin8Profile::BUCKET, true, 0, 0, bucket);
         std::vector<uint64_t> made(par.threads, 0);
         std::vector<uint64_t> seen(par.threads, 0);
         double mark = omp_get_wtime();
@@ -784,7 +801,7 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
         for (size_t window = 0; window + 1 < cuts.size(); window++) {
         RawArray<KmerRecord> records;
         mark = omp_get_wtime();
-        loadWindow(bucketSegments, subCounts, cuts[window], cuts[window + 1], par.threads, what, records);
+        loadWindow(bucketSegments, subCounts, cuts[window], cuts[window + 1], par.threads, what, records, &profile);
         spentReading += omp_get_wtime() - mark;
         if (records.size() == 0) {
             continue;
@@ -792,8 +809,10 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
         mark = omp_get_wtime();
         const size_t bucketWorkSplits = par.threads * 8;
         const std::vector<size_t> threadOffsets = setupThreadOffsets(records, bucketWorkSplits);
+        Lin8Profile::Scope grouping(&profile, Lin8Profile::PAIR_GROUP, true, 0, records.size());
 #pragma omp parallel num_threads(par.threads)
         {
+            Lin8Profile::Scope worker(&profile, Lin8Profile::PAIR_GROUP);
             unsigned int thread = 0;
 #ifdef OPENMP
             thread = static_cast<unsigned int>(omp_get_thread_num());
@@ -836,8 +855,10 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
         pending += inBucket * PairRecord::DISK_BYTES;
         const bool last = bucket + node.count >= buckets;
         if (pending >= CHECKPOINT_BYTE_LIMIT || last) {
+            Lin8Profile::Scope checkpoint(&profile, Lin8Profile::CHECKPOINT, true, pending, 0, chunk);
             const double put = omp_get_wtime();
             writer.finishChunk(par.threads);
+            Lin8Profile::Scope metadata(&profile, Lin8Profile::METADATA, true);
             writeBucketManifest(prefix + "." + SSTR(chunk) + ".manifest", writer.chunkCounts(),
                                 writer.chunkBytes(), writer.chunkIndexBytes(), "bucket", chunkFirst, bucket + 1);
             writeSubBucketCounts(countsPath, repRankSubBlockBase, repRankSubBlockCounts, chunk + 1);
@@ -870,6 +891,8 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
                        << "s\n";
     Debug(Debug::INFO) << "Made " << pairs << " pairs from " << groups << " groups in " << timer.lap() << "\n";
     reader.close();
+    total.stop();
+    profile.report();
     return EXIT_SUCCESS;
 }
 
@@ -962,6 +985,8 @@ int lin8pref(int argc, const char **argv, const Command &command) {
 
     FileUtil::fixRlimitNoFile();
     const NodePlacement node = NodePlacement::resolve(par);
+    Lin8Profile profile("pref", par.threads);
+    Lin8Profile::Scope total(&profile, Lin8Profile::TOTAL, true);
     unsigned int writerNodes = 0;
     size_t repRankBlocks = 0;
     uint64_t ranks = 0;
@@ -999,12 +1024,13 @@ int lin8pref(int argc, const char **argv, const Command &command) {
     std::vector<std::vector<unsigned char> > packed(par.threads);
     RawArray<PairRecord> pairs;
     for (size_t repRankBlock = node.index; repRankBlock < repRankBlocks; repRankBlock += node.count) {
+        Lin8Profile::Scope blockWork(&profile, Lin8Profile::BUCKET, true, 0, 0, repRankBlock);
         const std::string what = "Representative rank block " + SSTR(repRankBlock);
         const BucketSegments<PairSegmentCodec> segments(par.db1, writerNodes, repRankBlock);
         const std::vector<uint64_t> subCounts = repRankBlockCounts.of(repRankBlock);
         const std::vector<size_t> cuts = planWindows(segments, subCounts, budget, par.threads, what, "raise --pair-splits");
         for (size_t window = 0; window + 1 < cuts.size(); window++) {
-            loadWindow(segments, subCounts, cuts[window], cuts[window + 1], par.threads, what, pairs);
+            loadWindow(segments, subCounts, cuts[window], cuts[window + 1], par.threads, what, pairs, &profile);
             read += pairs.size();
             std::vector<size_t> starts(1, 0);
             for (size_t i = cuts[window]; i < cuts[window + 1]; i++) {
@@ -1116,5 +1142,7 @@ int lin8pref(int argc, const char **argv, const Command &command) {
     markNodeDone(par.db3, node.index);
     live.close();
     Debug(Debug::INFO) << "Read " << read << " pairs, kept " << kept << " in " << timer.lap() << "\n";
+    total.stop();
+    profile.report();
     return EXIT_SUCCESS;
 }

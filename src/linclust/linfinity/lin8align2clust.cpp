@@ -1,5 +1,6 @@
 #include "Lin8Db.h"
 #include "Lin8DbReader.h"
+#include "Lin8Memory.h"
 #include "Parameters.h"
 #include "Debug.h"
 #include "FileUtil.h"
@@ -503,7 +504,14 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
     // a batch fills every lane four times over, so the fork and join are lost in the aligning
     const size_t batchRows = (size_t) threads * Lin8DbReader::LANES * MEMBERS_PER_ALIGN_BATCH * 8;
     Debug(Debug::INFO) << "Batches of " << batchRows << " rows\n";
-    reader.openBatch(threads, ARENA_BYTES, Util::computeMemory(par.splitMemoryLimit),
+    const size_t memory = Util::computeMemory(par.splitMemoryLimit);
+    const size_t reserved = reader.keptBytes() + Lin8Memory::bitmapBytes(ranks)
+                           + (node.count > 1 && node.index == 0 ? Lin8Memory::deciderBytes(ranks) : 0);
+    requireMemory("Alignment bitmaps and the co-located decider", reserved, memory,
+                  "raise --split-memory-limit or use a larger-memory node");
+    Debug(Debug::INFO) << "Reserving " << (reserved >> 20)
+                       << " MiB for bitmaps and the co-located decider before sizing reads\n";
+    reader.openBatch(threads, ARENA_BYTES, memory - reserved,
                      Lin8DbReader::READ_AGAIN, Lin8DbReader::ACCESS_RANDOM, par.lin8ReadCache);
 
     SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, par.scoreBias);

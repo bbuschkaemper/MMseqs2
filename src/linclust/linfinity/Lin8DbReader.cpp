@@ -420,8 +420,8 @@ void Lin8DbReader::close() {
     }
     batch.clear();
     if (useCache) {
-        Debug(Debug::INFO) << "Chunk cache: " << cache.hits << " hits, " << cache.misses << " misses ("
-                           << ((cache.misses * ChunkCache::CHUNK) >> 30) << " GB read), " << cache.busy
+        Debug(Debug::INFO) << "Chunk cache: " << cache.count(ChunkCache::HIT) << " hits, " << cache.count(ChunkCache::MISS) << " misses ("
+                           << ((cache.count(ChunkCache::MISS) * ChunkCache::CHUNK) >> 30) << " GB read), " << cache.count(ChunkCache::BUSY)
                            << " reads made on their own\n";
         cache.close();
         useCache = false;
@@ -944,4 +944,3 @@ size_t Lin8DbReader::startBatch(uint64_t queryRank, const uint64_t *members, siz
     at.ring.submit(db.c_str());
     return loaded;
 }
-

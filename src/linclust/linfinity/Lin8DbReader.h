@@ -120,6 +120,12 @@ public:
     bool hasKeptBitmap() const { return keptLoaded; }
     const uint64_t *keptWords() const { return kept; }
     size_t keptWordCount() const { return keptCount; }
+    size_t keptBytes() const { return keptSize; }
+    size_t headerBytes() const {
+        size_t total = 0;
+        for (size_t i = 0; i < headerSize.size(); i++) total += headerSize[i];
+        return total;
+    }
 
     void releaseFileSlot(size_t suffix);
 

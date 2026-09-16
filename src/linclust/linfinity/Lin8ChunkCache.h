@@ -22,7 +22,7 @@ public:
     static const unsigned WAYS = 8;
     enum Outcome { HIT, MISS, PENDING, BUSY };
 
-    ChunkCache() : bytes(NULL), tick(0), hits(0), misses(0), busy(0) {}
+    ChunkCache() : bytes(NULL), stripes(NULL) {}
     ~ChunkCache() { close(); }
 
     bool open(size_t wanted);
@@ -35,27 +35,36 @@ public:
     // abandon empties a slot acquired with MISS that will not be filled after all
     void release(uint32_t slot, bool abandon);
 
-    uint64_t hits, misses, busy;
+    // Read after the workers have joined.
+    uint64_t count(Outcome outcome) const;
 
 private:
     enum State { EMPTY, FILLING, READY };
     struct Slot {
         uint64_t key;
-        uint32_t stamp;
+        uint64_t stamp;
         uint32_t pins;
         uint8_t state;
     };
     static const unsigned STRIPES = 4096;
+    struct alignas(64) Stripe {
+        uint64_t tick = 0;
+        uint64_t hits = 0;
+        uint64_t misses = 0;
+        uint64_t busy = 0;
+#ifdef OPENMP
+        omp_lock_t lock;
+#endif
+    };
 
     void lock(uint32_t slot);
     void unlock(uint32_t slot);
 
     char *bytes;
-    uint32_t tick;
     std::vector<Slot> slots;
-#ifdef OPENMP
-    omp_lock_t locks[STRIPES];
-#endif
+    // Explicitly aligned allocation also works when the enclosing reader is
+    // heap-allocated by a C++11 caller (ordinary new need not honor alignas(64)).
+    Stripe *stripes;
 };
 
 #endif

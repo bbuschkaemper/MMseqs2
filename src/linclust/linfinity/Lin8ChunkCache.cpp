@@ -1,13 +1,15 @@
 #include "Lin8ChunkCache.h"
 
 #include <sys/mman.h>
+#include <cstdlib>
+#include <new>
 
 static const uint64_t NO_KEY = ~uint64_t(0);
 
 // the slots of a set share a stripe, so one lock covers an acquire
 void ChunkCache::lock(uint32_t slot) {
 #ifdef OPENMP
-    omp_set_lock(&locks[(slot / WAYS) % STRIPES]);
+    omp_set_lock(&stripes[(slot / WAYS) % STRIPES].lock);
 #else
     (void) slot;
 #endif
@@ -15,7 +17,7 @@ void ChunkCache::lock(uint32_t slot) {
 
 void ChunkCache::unlock(uint32_t slot) {
 #ifdef OPENMP
-    omp_unset_lock(&locks[(slot / WAYS) % STRIPES]);
+    omp_unset_lock(&stripes[(slot / WAYS) % STRIPES].lock);
 #else
     (void) slot;
 #endif
@@ -23,7 +25,9 @@ void ChunkCache::unlock(uint32_t slot) {
 
 bool ChunkCache::open(size_t wanted) {
     close();
-    const size_t chunks = wanted / CHUNK / WAYS * WAYS;
+    const size_t stripeBytes = STRIPES * sizeof(Stripe);
+    const size_t chunks = (wanted > stripeBytes ? wanted - stripeBytes : 0)
+                          / (CHUNK + sizeof(Slot)) / WAYS * WAYS;
     if (chunks < 16 * (size_t) WAYS) {
         return false;
     }
@@ -32,6 +36,12 @@ bool ChunkCache::open(size_t wanted) {
     if (at == MAP_FAILED) {
         return false;
     }
+    void *stripeMemory = NULL;
+    if (posix_memalign(&stripeMemory, alignof(Stripe), stripeBytes) != 0) {
+        munmap(at, chunks * CHUNK);
+        return false;
+    }
+    stripes = static_cast<Stripe *>(stripeMemory);
     // chunks land at hashed positions, so a huge page would be faulted in for every chunk
     // touched and a sparsely used cache would take far more than it holds
 #ifdef MADV_NOHUGEPAGE
@@ -40,12 +50,12 @@ bool ChunkCache::open(size_t wanted) {
     bytes = static_cast<char *>(at);
     const Slot empty = {NO_KEY, 0, 0, EMPTY};
     slots.assign(chunks, empty);
-    tick = 0;
-#ifdef OPENMP
     for (unsigned i = 0; i < STRIPES; i++) {
-        omp_init_lock(&locks[i]);
-    }
+        new (&stripes[i]) Stripe();
+#ifdef OPENMP
+        omp_init_lock(&stripes[i].lock);
 #endif
+    }
     return true;
 }
 
@@ -58,9 +68,11 @@ void ChunkCache::close() {
     slots.clear();
 #ifdef OPENMP
     for (unsigned i = 0; i < STRIPES; i++) {
-        omp_destroy_lock(&locks[i]);
+        omp_destroy_lock(&stripes[i].lock);
     }
 #endif
+    free(stripes);
+    stripes = NULL;
 }
 
 ChunkCache::Outcome ChunkCache::acquire(uint32_t file, uint64_t chunk, uint32_t &slot) {
@@ -71,7 +83,8 @@ ChunkCache::Outcome ChunkCache::acquire(uint32_t file, uint64_t chunk, uint32_t 
     lock(first);
     // pins and states are changed without the lock elsewhere, but only ever downward and
     // forward: a slot seen free here stays free until this acquire takes it
-    const uint32_t now = __atomic_add_fetch(&tick, 1, __ATOMIC_RELAXED);
+    Stripe &stripe = stripes[(first / WAYS) % STRIPES];
+    const uint64_t now = ++stripe.tick;
     Outcome out = BUSY;
     uint32_t victim = ~0u;
     for (uint32_t i = first; i < first + WAYS; i++) {
@@ -89,7 +102,7 @@ ChunkCache::Outcome ChunkCache::acquire(uint32_t file, uint64_t chunk, uint32_t 
         }
         // an empty slot first, then the one acquired longest ago
         if (victim == ~0u || s.state == EMPTY
-            || (slots[victim].state != EMPTY && (int32_t) (s.stamp - slots[victim].stamp) < 0)) {
+            || (slots[victim].state != EMPTY && s.stamp < slots[victim].stamp)) {
             victim = i;
         }
     }
@@ -102,9 +115,18 @@ ChunkCache::Outcome ChunkCache::acquire(uint32_t file, uint64_t chunk, uint32_t 
         slot = victim;
         out = MISS;
     }
-    __atomic_fetch_add(out == MISS ? &misses : out == BUSY ? &busy : &hits, 1, __ATOMIC_RELAXED);
+    ++(out == MISS ? stripe.misses : out == BUSY ? stripe.busy : stripe.hits);
     unlock(first);
     return out;
+}
+
+uint64_t ChunkCache::count(Outcome outcome) const {
+    uint64_t total = 0;
+    if (stripes == NULL) return total;
+    for (unsigned i = 0; i < STRIPES; i++) {
+        total += outcome == MISS ? stripes[i].misses : outcome == BUSY ? stripes[i].busy : stripes[i].hits;
+    }
+    return total;
 }
 
 void ChunkCache::filled(uint32_t slot) {

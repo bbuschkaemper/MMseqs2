@@ -5,6 +5,7 @@
 #include "FileUtil.h"
 #include "Util.h"
 #include "Timer.h"
+#include "MemoryMapped.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -39,7 +40,8 @@ struct PackedNames {
         chunk.resize((size_t) ((total + NAME_CHUNK - 1) >> NAME_CHUNK_BITS));
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
         for (size_t which = 0; which < chunk.size(); which++) {
-            std::vector<char>(NAME_CHUNK).swap(chunk[which]);
+            const size_t size = (size_t) std::min<uint64_t>(NAME_CHUNK, total - which * NAME_CHUNK);
+            std::vector<char>(size).swap(chunk[which]);
         }
     }
 
@@ -68,7 +70,11 @@ struct PackedNames {
     }
 
     size_t lengthOf(uint64_t rank) const { return (size_t) (at[rank + 1] - at[rank]); }
-    size_t bytes() const { return chunk.size() * NAME_CHUNK + at.size() * sizeof(uint64_t); }
+    size_t bytes() const {
+        size_t total = at.size() * sizeof(uint64_t);
+        for (size_t i = 0; i < chunk.size(); i++) total += chunk[i].size();
+        return total;
+    }
 };
 
 // the name Util::parseFastaHeader cuts from a header line, without a string per header: the scratch
@@ -93,19 +99,38 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
     reader.open();
 
     const size_t budget = Util::computeMemory(par.splitMemoryLimit);
-    const size_t need = reader.getSize() * (sizeof(uint64_t) + 24);
-    if (need > budget) {
-        // no room to name every sequence, so skip the tsv instead of ending the run
-        Debug(Debug::WARNING) << "Naming " << reader.getSize() << " sequences would need about "
-                              << (need >> 30) << " GB and the limit is " << (budget >> 30)
-                              << " GB, so no tsv was written. Use the cluster database (by rank) or "
-                              << "lin8-createrepseqfasta instead\n";
+    const unsigned int threads = std::max<unsigned int>(1, par.threads);
+    const auto skip = [&]() {
+        Debug(Debug::WARNING) << "Names, headers and the cluster index exceed the " << (budget >> 20)
+                              << " MiB naming budget; no TSV was written. Keep the sequence database "
+                              << par.db1 << " to preserve the rank-to-name mapping\n";
         reader.close();
         return EXIT_SUCCESS;
+    };
+    // Count the index without allocating DBReader's per-cluster table. Include
+    // mapped files, index sorting/mappings and per-thread header/output scratch.
+    const size_t indexBytes = FileUtil::getFileSize(par.db2Index);
+    size_t need = (reader.getSize() + 1) * sizeof(uint64_t) + reader.keptBytes();
+    const auto reserve = [&](size_t bytes) {
+        if (need > budget || bytes > budget - need) return false;
+        need += bytes;
+        return true;
+    };
+    if (!reserve(indexBytes) || !reserve(reader.headerBytes())
+        || !reserve((size_t) threads * (32u << 20))) return skip();
+    {
+        MemoryMapped index(par.db2Index.c_str(), MemoryMapped::WholeFile, MemoryMapped::SequentialScan);
+        if (!index.isValid()) {
+            Debug(Debug::ERROR) << "Cannot open " << par.db2Index << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        const size_t clusters = Util::ompCountLines((char *) index.getData(), index.size(), threads);
+        const size_t perCluster = sizeof(DBReader<DBKeyType>::Index) + 2 * sizeof(DBLocalId)
+                                 + 2 * sizeof(size_t);
+        if (clusters > budget / perCluster || !reserve(clusters * perCluster)) return skip();
     }
 
     Timer timer;
-    const unsigned int threads = std::max<unsigned int>(1, par.threads);
     PackedNames nameOfRank(reader.getSize());
     // a length range is a run of headers a stream can start at on its own, so the ranges are the
     // units of work: a first pass measures the names of every range, a prefix sum places the ranges,
@@ -161,6 +186,7 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
             for (size_t r = 0; r < rangeCount; r++) {
                 startOfRange[r + 1] += startOfRange[r];
             }
+            if (!reserve(startOfRange[rangeCount])) return skip();
             nameOfRank.reserve(startOfRange[rangeCount], threads);
         }
     }

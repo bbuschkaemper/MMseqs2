@@ -1,5 +1,6 @@
 #include "Lin8Db.h"
 #include "Lin8DbReader.h"
+#include "Lin8Memory.h"
 #include "Parameters.h"
 #include "Debug.h"
 #include "FileUtil.h"
@@ -28,9 +29,7 @@ static void readPipelineShape(const std::string &path, unsigned int &nodes, size
     }
 }
 
-static void readNodeRepRankBlock(const std::string &prefix, unsigned int node, size_t repRankBlock,
-                                 size_t budget, std::vector<PairRecord> &rows) {
-    rows.clear();
+static FILE *openNodeRepRankBlock(const std::string &prefix, unsigned int node, size_t repRankBlock) {
     const std::string path = prefix + "." + SSTR(node) + "." + SSTR(repRankBlock);
     FILE *in = NULL;
     // the marker follows the rename, so a miss here is attribute cache lag and never permanent
@@ -42,19 +41,11 @@ static void readNodeRepRankBlock(const std::string &prefix, unsigned int node, s
         sleep(1);
     }
     const size_t bytes = FileUtil::getFileSize(path);
-    requireMemory("Representative rank block " + SSTR(repRankBlock),
-                 bytes / PairRecord::DISK_BYTES * sizeof(PairRecord), budget, "raise --pair-splits");
-    rows.reserve(bytes / PairRecord::DISK_BYTES);
-    std::vector<PairRecord> buffer(1u << 16);
-    size_t read = 0;
-    while ((read = readRecords(buffer.data(), buffer.size(), in)) > 0) {
-        rows.insert(rows.end(), buffer.begin(), buffer.begin() + read);
-    }
-    if (ferror(in) != 0) {
-        Debug(Debug::ERROR) << "Cannot read " << path << "\n";
+    if (bytes % PairRecord::DISK_BYTES != 0) {
+        Debug(Debug::ERROR) << "Truncated pair record in " << path << "\n";
         EXIT(EXIT_FAILURE);
     }
-    fclose(in);
+    return in;
 }
 
 int lin8align2clustmulti(int argc, const char **argv, const Command &command) {
@@ -75,17 +66,19 @@ int lin8align2clustmulti(int argc, const char **argv, const Command &command) {
         par.lin8RepRankBlockCount <= 0
             ? repRankBlocks
             : std::min(firstRepRankBlock + (size_t) par.lin8RepRankBlockCount, repRankBlocks);
+    const size_t budget = Util::computeMemory(par.splitMemoryLimit);
+    requireMemory("Decider bitmap and streaming buffers", Lin8Memory::deciderBytes(ranks), budget,
+                  "raise --split-memory-limit or use a larger-memory node");
     ClusterAssignmentBitmap assignedCluster;
     assignedCluster.open(par.db3 + ".cluster_assigned", ranks);
     assignedCluster.catchUpTo(par.db3, firstRepRankBlock);
 
-    const size_t budget = Util::computeMemory(par.splitMemoryLimit);
     Timer timer;
     uint64_t clusters = 0;
     uint64_t assigned = 0;
-    std::vector<PairRecord> rows;
+    std::vector<PairRecord> rows(1u << 16);
     std::vector<PairRecord> outBuffer;
-    std::vector<uint64_t> members;
+    outBuffer.reserve(1u << 16);
     const bool wantText = par.includeAlignFiles;
     std::string text;
     Debug::Progress progress(repRankBlocks);
@@ -108,87 +101,101 @@ int lin8align2clustmulti(int argc, const char **argv, const Command &command) {
         }
         uint64_t lastRep = 0;
         for (unsigned int chunk = 0; chunk < alignNodes; chunk++) {
-        waitNodeDone(par.db1 + "." + SSTR(repRankBlock), chunk, 3600);
-        AlnTextReader *textIn = wantText ? new AlnTextReader(par.db1, chunk, repRankBlock, true) : NULL;
-        outBuffer.clear();
-        readNodeRepRankBlock(par.db1, chunk, repRankBlock,
-                         budget > assignedCluster.bytesHeld() ? budget - assignedCluster.bytesHeld() : 0, rows);
-        size_t at = 0;
-        while (at < rows.size()) {
-            const uint64_t rep = rows[at].rep();
-            if (rep < lastRep) {
-                Debug(Debug::ERROR) << "Representative rank block " << repRankBlock << " goes back from representative "
-                                    << lastRep << " to " << rep
-                                    << ". The aligning pass did not cut it in rank order\n";
-                EXIT(EXIT_FAILURE);
-            }
-            lastRep = rep;
-            size_t end = at;
-            while (end < rows.size() && rows[end].rep() == rep) {
-                end++;
-            }
-            members.clear();
-            for (size_t i = at; i < end; i++) {
-                members.push_back(rows[i].member());
-            }
-            const size_t before = outBuffer.size();
-            const bool made = assignCluster(rep, members.data(), members.size(), assignedCluster,
-                                            outBuffer, assigned);
-            clusters += made ? 1 : 0;
-            // the text lines are one per pair in the same order, so the accepted ones fall out of a walk
-            if (wantText) {
-                text.clear();
-                if (made) {
-                    text.push_back(ALN_TEXT_REP_MARK);
-                    text.push_back('\t');
-                    text.append(SSTR(rep));
-                    text.push_back('\n');
-                }
-                size_t j = before;
-                for (size_t i = at; i < end; i++) {
-                    char *line = NULL;
-                    size_t length = 0;
-                    if (textIn->next(line, length) == false) {
-                        Debug(Debug::ERROR) << textIn->name() << " holds fewer lines than the "
-                                            << "aligned pairs of repRankBlock " << repRankBlock << "\n";
+            waitNodeDone(par.db1 + "." + SSTR(repRankBlock), chunk, 3600);
+            AlnTextReader *textIn = wantText ? new AlnTextReader(par.db1, chunk, repRankBlock, true) : NULL;
+            outBuffer.clear();
+            FILE *in = openNodeRepRankBlock(par.db1, chunk, repRankBlock);
+            size_t read = 0;
+            bool haveRep = false, made = false, selfText = false;
+            uint64_t currentRep = 0;
+            while ((read = readRecords(rows.data(), rows.size(), in)) > 0) {
+                for (size_t at = 0; at < read; at++) {
+                    const uint64_t rep = rows[at].rep(), member = rows[at].member();
+                    if (rep >= ranks || member >= ranks) {
+                        Debug(Debug::ERROR) << "Aligned row names a rank outside the database\n";
                         EXIT(EXIT_FAILURE);
                     }
-                    if (j < outBuffer.size() && rows[i].member() == outBuffer[j].member()) {
-                        text.append(line, length);
-                        j++;
+                    if (rep < lastRep) {
+                        Debug(Debug::ERROR) << "Representative rank block " << repRankBlock << " goes back from representative "
+                                            << lastRep << " to " << rep
+                                            << ". The aligning pass did not cut it in rank order\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    lastRep = rep;
+                    text.clear();
+                    if (!haveRep || rep != currentRep) {
+                        haveRep = true;
+                        currentRep = rep;
+                        selfText = false;
+                        made = !assignedCluster.isAssigned(rep);
+                        if (made) {
+                            assignedCluster.assign(rep);
+                            PairRecord self;
+                            self.set(rep, rep, 0);
+                            outBuffer.push_back(self);
+                            clusters++;
+                            if (wantText) {
+                                text.push_back(ALN_TEXT_REP_MARK);
+                                text.push_back('\t');
+                                text.append(SSTR(rep));
+                                text.push_back('\n');
+                            }
+                        }
+                    }
+                    bool keepText = made && member == rep && !selfText;
+                    if (member == rep) selfText = true;
+                    if (made && member != rep && !assignedCluster.isAssigned(member)) {
+                        assignedCluster.assign(member);
+                        PairRecord accepted;
+                        accepted.set(rep, member, 0);
+                        outBuffer.push_back(accepted);
+                        assigned++;
+                        keepText = true;
+                    }
+                    if (wantText) {
+                        char *line = NULL;
+                        size_t length = 0;
+                        if (textIn->next(line, length) == false) {
+                            Debug(Debug::ERROR) << textIn->name() << " holds fewer lines than the "
+                                                << "aligned pairs of repRankBlock " << repRankBlock << "\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+                        if (keepText) text.append(line, length);
+                        if (text.empty() == false
+                            && fwrite(text.c_str(), 1, text.size(), textOut) != text.size()) {
+                            Debug(Debug::ERROR) << "Cannot write " << textTmp << "\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+                    }
+                    if (outBuffer.size() >= (1u << 16)) {
+                        if (writeRecords(outBuffer.data(), outBuffer.size(), out)
+                            != outBuffer.size()) {
+                            Debug(Debug::ERROR) << "Cannot write " << outTmp << "\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+                        outBuffer.clear();
                     }
                 }
-                if (text.empty() == false
-                    && fwrite(text.c_str(), 1, text.size(), textOut) != text.size()) {
-                    Debug(Debug::ERROR) << "Cannot write " << textTmp << "\n";
-                    EXIT(EXIT_FAILURE);
-                }
             }
-            at = end;
-            if (outBuffer.size() >= (1u << 16)) {
-                if (writeRecords(outBuffer.data(), outBuffer.size(), out)
-                    != outBuffer.size()) {
-                    Debug(Debug::ERROR) << "Cannot write " << outTmp << "\n";
-                    EXIT(EXIT_FAILURE);
-                }
-                outBuffer.clear();
-            }
-        }
-        if (outBuffer.empty() == false
-            && writeRecords(outBuffer.data(), outBuffer.size(), out) != outBuffer.size()) {
-            Debug(Debug::ERROR) << "Cannot write " << outTmp << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        if (wantText) {
-            char *line = NULL;
-            size_t length = 0;
-            if (textIn->next(line, length)) {
-                Debug(Debug::ERROR) << textIn->name() << " holds more lines than the aligned pairs "
-                                    << "of repRankBlock " << repRankBlock << "\n";
+            if (ferror(in) != 0 || fclose(in) != 0) {
+                Debug(Debug::ERROR) << "Cannot finish reading aligned block " << repRankBlock << "\n";
                 EXIT(EXIT_FAILURE);
             }
-            delete textIn;
-        }
+            if (outBuffer.empty() == false
+                && writeRecords(outBuffer.data(), outBuffer.size(), out) != outBuffer.size()) {
+                Debug(Debug::ERROR) << "Cannot write " << outTmp << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            if (wantText) {
+                char *line = NULL;
+                size_t length = 0;
+                if (textIn->next(line, length)) {
+                    Debug(Debug::ERROR) << textIn->name() << " holds more lines than the aligned pairs "
+                                        << "of repRankBlock " << repRankBlock << "\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                delete textIn;
+            }
         }
         if (fclose(out) != 0) {
             Debug(Debug::ERROR) << "Cannot close " << outTmp << "\n";

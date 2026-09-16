@@ -10,6 +10,7 @@
 #include "Debug.h"
 #include "FileUtil.h"
 #include "Util.h"
+#include "Lin8Profile.h"
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -299,8 +300,8 @@ template <typename Record, typename Encoder = PackRecords<Record> >
 class BucketWriter {
 public:
     BucketWriter(const std::string &prefix, size_t buckets, unsigned int threads, size_t budget,
-                 const Encoder &encoder = Encoder())
-        : prefix(prefix), buckets(buckets), encoder(encoder), written(buckets, 0),
+                 const Encoder &encoder = Encoder(), Lin8Profile *profile = NULL)
+        : prefix(prefix), buckets(buckets), encoder(encoder), profile(profile), written(buckets, 0),
           bytes(buckets, 0), indexBytes(buckets, 0), offsets(buckets, 0), indexOffsets(buckets, 0),
           pendingIndex(buckets), staged(threads, std::vector<std::vector<Record> >(buckets)) {
         const size_t share = budget / STAGING_SHARE;
@@ -413,6 +414,7 @@ public:
     }
 
     void finishChunk(unsigned int threads) {
+        Lin8Profile::Scope flushPhase(profile, Lin8Profile::CHECKPOINT_FLUSH_PHASE, true);
 #pragma omp parallel for schedule(dynamic, 16) num_threads(threads)
         for (size_t bucket = 0; bucket < buckets; bucket++) {
             for (size_t thread = 0; thread < staged.size(); thread++) {
@@ -422,16 +424,20 @@ public:
             writeIndex(bucket);
             if (written[bucket] > 0) {
                 const int fd = fdOf(bucket);
+                Lin8Profile::Scope writeback(profile, Lin8Profile::WRITER_WRITEBACK);
                 sync_file_range(fd, 0, 0, SYNC_FILE_RANGE_WRITE);
                 release(fd, bucket);
             }
         }
+        flushPhase.stop();
+        Lin8Profile::Scope syncPhase(profile, Lin8Profile::CHECKPOINT_SYNC_PHASE, true);
 #pragma omp parallel for schedule(dynamic, 16) num_threads(threads)
         for (size_t bucket = 0; bucket < buckets; bucket++) {
             if (written[bucket] == 0) {
                 continue;
             }
             const int fd = fdOf(bucket);
+            Lin8Profile::Scope sync(profile, Lin8Profile::WRITER_SYNC);
             if (fdatasync(fd) != 0) {
                 Debug(Debug::ERROR) << "Cannot flush " << name(bucket) << " to storage\n";
                 EXIT(EXIT_FAILURE);
@@ -466,10 +472,13 @@ private:
         if (buffer.empty()) {
             return;
         }
+        Lin8Profile::Scope wait(profile, Lin8Profile::WRITER_WAIT);
         while (__sync_lock_test_and_set(&gate[bucket], 1) != 0) {
             while (__atomic_load_n(&gate[bucket], __ATOMIC_RELAXED) != 0) {
             }
         }
+        wait.stop();
+        Lin8Profile::Scope copy(profile, Lin8Profile::WRITER_COPY, false, buffer.size() * sizeof(Record), buffer.size());
         std::vector<Record> &pool = pooled[bucket];
         if (pool.capacity() < poolDepth + depth) {
             pool.reserve(poolDepth + depth);
@@ -493,6 +502,7 @@ private:
         }
         __sync_lock_release(&gate[bucket]);
         buffer.clear();
+        copy.stop();
         flush(bucket, outbound);
     }
 
@@ -508,14 +518,17 @@ private:
         __sync_fetch_and_add(&written[bucket], buffer.size());
         __sync_fetch_and_add(&bytes[bucket], size);
         const int fd = fdOf(bucket);
+        Lin8Profile::Scope write(profile, Lin8Profile::WRITER_WRITE, false, size, buffer.size());
         const ssize_t wrote = pwrite(fd, packed.data(), size, static_cast<off_t>(at));
         if (wrote < 0 || static_cast<size_t>(wrote) != size) {
             Debug(Debug::ERROR) << "Cannot write " << size << " byte to " << name(bucket) << "\n";
             EXIT(EXIT_FAILURE);
         }
         release(fd, bucket);
+        write.stop();
         buffer.clear();
         if (index.empty() == false) {
+            Lin8Profile::Scope indexWork(profile, Lin8Profile::WRITER_INDEX);
             const uint64_t where[2] = {at, size};
 #pragma omp critical(bucket_index)
             {
@@ -533,8 +546,11 @@ private:
         if (pending.empty()) {
             return;
         }
+        Lin8Profile::Scope write(profile, Lin8Profile::WRITER_INDEX, false, pending.size());
         const int fd = open(indexName(bucket).c_str(), O_WRONLY | O_CREAT, 0666);
         const ssize_t wrote = fd < 0 ? -1 : pwrite(fd, pending.data(), pending.size(), static_cast<off_t>(indexOffsets[bucket]));
+        write.stop();
+        Lin8Profile::Scope sync(profile, Lin8Profile::WRITER_INDEX_SYNC);
         if (wrote < 0 || static_cast<size_t>(wrote) != pending.size() || fdatasync(fd) != 0 || ::close(fd) != 0) {
             Debug(Debug::ERROR) << "Cannot write " << pending.size() << " byte to " << indexName(bucket) << "\n";
             EXIT(EXIT_FAILURE);
@@ -550,6 +566,7 @@ private:
     std::string prefix;
     size_t buckets;
     Encoder encoder;
+    Lin8Profile *profile;
     size_t depth;
     size_t poolDepth;
     std::vector<std::vector<Record> > pooled;
@@ -865,10 +882,14 @@ inline void markSubStart(SegmentHeader &header, unsigned int &sub, unsigned int 
 template <class Codec>
 struct SegmentEncoder {
     Codec codec;
-    SegmentEncoder(const Codec &codec) : codec(codec) {}
+    Lin8Profile *profile;
+    SegmentEncoder(const Codec &codec, Lin8Profile *profile = NULL) : codec(codec), profile(profile) {}
     void operator()(std::vector<typename Codec::Record> &records, std::vector<unsigned char> &out,
                     std::vector<unsigned char> &index) const {
+        Lin8Profile::Scope sort(profile, Lin8Profile::WRITER_SORT, false, 0, records.size());
         std::sort(records.begin(), records.end(), Codec::less);
+        sort.stop();
+        Lin8Profile::Scope encode(profile, Lin8Profile::WRITER_ENCODE, false, 0, records.size());
         SegmentHeader header;
         codec.encode(records, out, header);
         index.assign(reinterpret_cast<const unsigned char *>(&header),
@@ -979,27 +1000,44 @@ std::vector<size_t> planWindows(const BucketSegments<Codec> &bucketSegments, con
 // reads one slice of every segment for [from, to) and merges each sub-bucket into the order the sort made
 template <class Codec>
 void loadWindow(const BucketSegments<Codec> &bucketSegments, const std::vector<uint64_t> &subCounts, size_t from, size_t to,
-               unsigned int threads, const std::string &what, RawArray<typename Codec::Record> &into) {
+               unsigned int threads, const std::string &what, RawArray<typename Codec::Record> &into,
+               Lin8Profile *profile = NULL) {
     typedef typename Codec::Record Record;
     const std::vector<Segment> &segments = bucketSegments.segments;
     std::vector<size_t> starts(to - from + 1, 0);
     for (size_t sub = from; sub < to; sub++) {
         starts[sub - from + 1] = starts[sub - from] + subCounts[sub];
     }
+    Lin8Profile::Scope outputAlloc(profile, Lin8Profile::WINDOW_OUTPUT_ALLOC, true,
+                                  starts.back() * sizeof(Record), starts.back());
     into.resize(starts.back());
+    outputAlloc.stop();
+    Lin8Profile::Scope window(profile, Lin8Profile::WINDOW, true, 0, starts.back());
 
+    // Whole-region process CPU includes runtime scheduling/barriers and allocation;
+    // nested worker CPU measures only the named operations. These scopes overlap.
+    Lin8Profile::Scope readPhase(profile, Lin8Profile::WINDOW_READ_PHASE, true, 0, segments.size());
     std::vector<std::vector<unsigned char> > packed(segments.size());
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
     for (size_t r = 0; r < segments.size(); r++) {
         const SegmentHeader &header = segments[r].header;
+        Lin8Profile::Scope bufferResize(profile, Lin8Profile::SEGMENT_BUFFER_RESIZE, false,
+                                       header.subStart[to] - header.subStart[from]);
         packed[r].resize(header.subStart[to] - header.subStart[from]);
+        bufferResize.stop();
+        Lin8Profile::Scope read(profile, Lin8Profile::SEGMENT_READ, false, packed[r].size());
         preadFully(segments[r].fd, packed[r].data(), packed[r].size(), segments[r].at + header.subStart[from], what);
     }
+    readPhase.stop();
 
+    Lin8Profile::Scope decodeMergePhase(profile, Lin8Profile::WINDOW_DECODE_MERGE_PHASE, true,
+                                       0, starts.back());
 #pragma omp parallel num_threads(threads)
     {
+        Lin8Profile::Scope scratchSetup(profile, Lin8Profile::SEGMENT_SCRATCH_SETUP);
         std::vector<Record> scratch;
         std::vector<size_t> begin(segments.size()), end(segments.size()), heap;
+        scratchSetup.stop();
         // the heap keeps the segment whose next record sorts first on top
         const auto later = [&](size_t a, size_t b) { return Codec::less(scratch[begin[b]], scratch[begin[a]]); };
 #pragma omp for schedule(dynamic, 1)
@@ -1010,7 +1048,11 @@ void loadWindow(const BucketSegments<Codec> &bucketSegments, const std::vector<u
             }
             size_t got = 0;
             heap.clear();
+            Lin8Profile::Scope scratchResize(profile, Lin8Profile::SEGMENT_SCRATCH_RESIZE, false,
+                                            want * sizeof(Record), want);
             scratch.resize(want);
+            scratchResize.stop();
+            Lin8Profile::Scope decode(profile, Lin8Profile::SEGMENT_DECODE, false, 0, want);
             for (size_t r = 0; r < segments.size(); r++) {
                 const SegmentHeader &header = segments[r].header;
                 const unsigned char *slice = packed[r].data() + (header.subStart[sub] - header.subStart[from]);
@@ -1027,6 +1069,8 @@ void loadWindow(const BucketSegments<Codec> &bucketSegments, const std::vector<u
                                     << want << ". Was " << Codec::PRODUCER << " still running?\n";
                 EXIT(EXIT_FAILURE);
             }
+            decode.stop();
+            Lin8Profile::Scope merge(profile, Lin8Profile::SEGMENT_MERGE, false, 0, want);
             Record *out = into.begin() + starts[sub - from];
             std::make_heap(heap.begin(), heap.end(), later);
             for (size_t i = 0; i < want; i++) {
@@ -1041,6 +1085,7 @@ void loadWindow(const BucketSegments<Codec> &bucketSegments, const std::vector<u
             }
         }
     }
+    decodeMergePhase.stop();
 }
 
 

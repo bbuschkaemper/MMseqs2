@@ -94,6 +94,7 @@ static double spentSpilling = 0;
 static double hashingThreadSeconds = 0;
 static uint64_t lengthGroupsSeen = 0;
 static uint64_t lengthGroupsOnOneThread = 0;
+static Lin8Profile *hashProfile = NULL;
 
 static uint32_t anchorLength(float identity) {
     if (identity >= 1.0f) {
@@ -190,6 +191,8 @@ static void reduceOneHashBucket(const Lin8DbReader &reader, const HashEntry *buc
         return;
     }
     claimed.assign(size, 0);
+    uint64_t comparisons = 0;
+    if (hashProfile) hashProfile->note(Lin8Profile::HASH_BUCKETS, size);
     for (size_t i = 0; i < size; i++) {
         if (claimed[i]) {
             continue;
@@ -199,6 +202,7 @@ static void reduceOneHashBucket(const Lin8DbReader &reader, const HashEntry *buc
             if (claimed[j]) {
                 continue;
             }
+            if (hashProfile && hashProfile->enabled) comparisons++;
             if (sequencesMatch(query, reader.getData(bucket[j].rankOf()), length, identity)) {
                 claimed[j] = 1;
                 ClusterPair pair;
@@ -209,6 +213,7 @@ static void reduceOneHashBucket(const Lin8DbReader &reader, const HashEntry *buc
         }
         claimed[i] = 1;
     }
+    if (hashProfile) hashProfile->note(Lin8Profile::HASH_COMPARISONS, comparisons);
 }
 
 static const size_t MAX_HASH_PARTITIONS = 4096;
@@ -318,10 +323,13 @@ static void reduceEntriesToClusters(const Lin8DbReader &reader, std::vector<Hash
                            uint32_t length, float identity,
                            unsigned int threads, std::vector<ClusterPair> &out, size_t &crowded) {
     double mark = omp_get_wtime();
+    Lin8Profile::Scope sorting(hashProfile, Lin8Profile::HASH_SORT, true, 0, entries.size());
     SORT_PARALLEL(entries.begin(), entries.end(), HashEntry::byHashAndRank);
+    sorting.stop();
     spentSorting += omp_get_wtime() - mark;
     mark = omp_get_wtime();
     std::vector<size_t> bucketStart;
+    Lin8Profile::Scope grouping(hashProfile, Lin8Profile::HASH_GROUP, true, 0, entries.size());
     for (size_t i = 0; i < entries.size();) {
         size_t j = i + 1;
         while (j < entries.size() && entries[j].hash == entries[i].hash) {
@@ -336,11 +344,14 @@ static void reduceEntriesToClusters(const Lin8DbReader &reader, std::vector<Hash
         i = j;
     }
     spentGrouping += omp_get_wtime() - mark;
+    grouping.stop();
     mark = omp_get_wtime();
     const unsigned int useThreads = threadsWorthStarting(bucketStart.size() / 2, threads);
     std::vector<std::vector<ClusterPair> > pairsPerThread(useThreads);
+    Lin8Profile::Scope comparing(hashProfile, Lin8Profile::HASH_COMPARE, true, 0, bucketStart.size() / 2);
 #pragma omp parallel num_threads(useThreads)
     {
+        Lin8Profile::Scope worker(hashProfile, Lin8Profile::HASH_COMPARE);
         unsigned int thread = 0;
 #ifdef OPENMP
         thread = static_cast<unsigned int>(omp_get_thread_num());
@@ -354,6 +365,8 @@ static void reduceEntriesToClusters(const Lin8DbReader &reader, std::vector<Hash
         }
     }
     spentComparing += omp_get_wtime() - mark;
+    comparing.stop();
+    Lin8Profile::Scope collect(hashProfile, Lin8Profile::HASH_CONCAT, true);
     for (unsigned int i = 0; i < useThreads; i++) {
         out.insert(out.end(), pairsPerThread[i].begin(), pairsPerThread[i].end());
     }
@@ -387,11 +400,16 @@ static void hashRankRange(const Lin8DbReader &reader, uint64_t from, uint64_t un
             return took;
         }
     };
+    Lin8Profile::Scope firstRead(hashProfile, Lin8Profile::HASH_READ);
     took[lane] = Fill::load(reader, at, until, perBatch, thread, lane, want[lane]);
+    firstRead.stop();
     while (took[lane] > 0) {
         const unsigned int next = lane ^ 1u;
+        Lin8Profile::Scope read(hashProfile, Lin8Profile::HASH_READ);
         took[next] = Fill::load(reader, at, until, perBatch, thread, next, want[next]);
         reader.awaitBatch(thread, lane);
+        read.stop();
+        Lin8Profile::Scope compute(hashProfile, Lin8Profile::HASH_COMPUTE, false, took[lane] * length, took[lane]);
         for (size_t i = 0; i < took[lane]; i++) {
             const char *data = (i == 0) ? reader.batchQueryAt(thread, lane)
                                         : reader.batchAt(thread, lane, i - 1);
@@ -439,10 +457,12 @@ static void reduceSequencesOfOneLength(const Lin8DbReader &reader, uint64_t rank
             const uint64_t until = rankBegin + span * (thread + 1) / useThreads;
             hashRankRange(reader, from, until, length, aa2num, anchorK, thread, perThread[thread]);
         }
+        Lin8Profile::Scope collect(hashProfile, Lin8Profile::HASH_CONCAT, true);
         for (unsigned int i = 0; i < useThreads; i++) {
             entries.insert(entries.end(), perThread[i].begin(), perThread[i].end());
             std::vector<HashEntry>().swap(perThread[i]);
         }
+        collect.stop();
         const double took = omp_get_wtime() - mark;
         spentHashing += took;
         hashingThreadSeconds += took * useThreads;
@@ -457,6 +477,7 @@ static void reduceSequencesOfOneLength(const Lin8DbReader &reader, uint64_t rank
     HashPartitions parts(tmpPrefix, partitions, useThreads);
 #pragma omp parallel num_threads(useThreads)
     {
+        Lin8Profile::Scope compute(hashProfile, Lin8Profile::HASH_COMPUTE);
         unsigned int thread = 0;
 #ifdef OPENMP
         thread = static_cast<unsigned int>(omp_get_thread_num());
@@ -494,7 +515,9 @@ static void reduceSequencesOfOneLength(const Lin8DbReader &reader, uint64_t rank
     }
     for (size_t at = 0; at < partitions; at++) {
         mark = omp_get_wtime();
+        Lin8Profile::Scope read(hashProfile, Lin8Profile::HASH_PARTITION_READ, true);
         parts.load(at, entries);
+        read.stop();
         spentSpilling += omp_get_wtime() - mark;
         reduceEntriesToClusters(reader, entries, length, identity, threads, out, crowded);
     }
@@ -591,6 +614,9 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
     FileUtil::fixRlimitNoFile();
 
     const NodePlacement node = NodePlacement::resolve(par);
+    Lin8Profile profile("clusthash", par.threads);
+    hashProfile = profile.enabled ? &profile : NULL;
+    Lin8Profile::Scope total(&profile, Lin8Profile::TOTAL, true);
     // a retry only waits for the other nodes; skip the reader, the matrix and the header it prints
     const bool alreadyFolded = FileUtil::fileExists(nodeDonePath(par.db2, node.index).c_str());
     Lin8DbReader reader(par.db1);
@@ -664,15 +690,22 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
                     next++;
                 }
                 const uint64_t rankAfter = index.rankAfter(next - 1);
+                Lin8Profile::Scope lengthWork(&profile, Lin8Profile::HASH_LENGTH, true, 0,
+                                             rankAfter - rankBegin, length);
                 if (hashPartitionCount(static_cast<size_t>(rankAfter - rankBegin), budget) > 1) {
                     oversized++;
                 }
                 reduceSequencesOfOneLength(reader, rankBegin, rankAfter, length, hashMat->aa2num, identity,
                                  anchorLength(identity), budget,
                                  par.threads, par.db2 + ".part" + uniqueTmpSuffix(), pairs, crowded);
+                Lin8Profile::Scope pairSort(&profile, Lin8Profile::HASH_PAIR_SORT, true, 0, pairs.size());
                 SORT_PARALLEL(pairs.begin(), pairs.end(), ClusterPair::byMemberAndRepresentative);
+                pairSort.stop();
+                Lin8Profile::Scope dedup(&profile, Lin8Profile::HASH_DEDUP, true, 0, pairs.size());
                 pairs.erase(std::unique(pairs.begin(), pairs.end(), ClusterPair::sameMember),
                             pairs.end());
+                dedup.stop();
+                Lin8Profile::Scope chain(&profile, Lin8Profile::HASH_CHAIN, true, 0, pairs.size());
                 for (size_t i = 0; i < pairs.size(); i++) {
                     ClusterPair want;
                     want.member = pairs[i].representative;
@@ -703,7 +736,10 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
                 }
                 pairs.erase(std::remove_if(pairs.begin(), pairs.end(), ClusterPair::isSelf),
                             pairs.end());
+                chain.stop();
                 if (pairs.empty() == false) {
+                    Lin8Profile::Scope write(&profile, Lin8Profile::HASH_WRITE, true,
+                                            pairs.size() * sizeof(ClusterPair), pairs.size());
                     if (fwrite(pairs.data(), sizeof(ClusterPair), pairs.size(), out) != pairs.size()) {
                         Debug(Debug::ERROR) << "Cannot write cluster pairs to " << pairsTmp << "\n";
                         EXIT(EXIT_FAILURE);
@@ -744,13 +780,18 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
         if (alreadyFolded == false) {
             reader.close();
         }
+        total.stop();
+        profile.report();
+        hashProfile = NULL;
         return EXIT_SUCCESS;
     }
     Debug(Debug::INFO) << "Folding done, merging the other nodes\n";
     waitEveryNodeDone(par.db2, node.count, 86400);
 
+    Lin8Profile::Scope merging(&profile, Lin8Profile::HASH_MERGE, true);
     const uint64_t all = mergeNodeShards(par.db2, par.db1 + Lin8DbReader::KEPT_BITMAP_SUFFIX,
                                          node.count, reader, uniqueTmpSuffix());
+    merging.stop();
     if (lengthGroupsSeen > 0)
     Debug(Debug::INFO) << "Time for hashing: " << (uint64_t) spentHashing
                        << "s sorting: " << (uint64_t) spentSorting << "s grouping: "
@@ -765,5 +806,8 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
                            / static_cast<double>(std::max<uint64_t>(reader.getSize(), 1)))
                        << "% removed)\n";
     reader.close();
+    total.stop();
+    profile.report();
+    hashProfile = NULL;
     return EXIT_SUCCESS;
 }

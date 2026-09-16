@@ -206,7 +206,7 @@ while [ "$R" -lt "$REP_RANK_BLOCKS" ]; do
             # shellcheck disable=SC2086
             quietOnRetry "$MMSEQS" lin8-align2clustmulti "$TMP/aln/aln" "$TMP/pref/pref" \
                 "$TMP/clu_accepted/clu_accepted" --pair-split "$R" \
-                --pair-split-count "$PAIR_SPLIT_COUNT" ${ALIGN_TEXT} ${ASSIGN_PAR} &
+                --pair-split-count "$PAIR_SPLIT_COUNT" --threads "$THREADS" ${ALIGN_TEXT} ${ASSIGN_PAR} &
             MULTI_PID=$!
         fi
         if notExists "$TMP/aln/aln.$_last.$NODE.done"; then
@@ -265,14 +265,14 @@ if [ "$NODE" -eq 0 ]; then
         if notExists "$TMP/clu_accepted_plus_redundant/clu_accepted_plus_redundant"; then
             # shellcheck disable=SC2086
             "$MMSEQS" lin8-mergehashredundancy "$CLUDB" "$TMP/hash" \
-                "$TMP/clu_accepted_plus_redundant/clu_accepted_plus_redundant" ${EXPAND_PAR} \
+                "$TMP/clu_accepted_plus_redundant/clu_accepted_plus_redundant" --threads "$THREADS" ${EXPAND_PAR} \
                 || fail "lin8-mergehashredundancy died"
         fi
         CLUDB="$TMP/clu_accepted_plus_redundant/clu_accepted_plus_redundant"
     fi
     if notExists "$OUT.dbtype"; then
         # shellcheck disable=SC2086
-        "$MMSEQS" lin8-createclusterdb "$CLUDB" "$OUT" ${CLUSTERDB_PAR} || fail "lin8-createclusterdb died"
+        "$MMSEQS" lin8-createclusterdb "$CLUDB" "$OUT" --threads "$THREADS" ${CLUSTERDB_PAR} || fail "lin8-createclusterdb died"
     fi
 
     # the alignments name the member that speaks for its cluster best, and the marker outlives
@@ -296,12 +296,12 @@ if [ "$NODE" -eq 0 ]; then
     # naming is its own pass, and it runs the way linclust names its answer: always
     if notExists "$OUT.tsv"; then
         # shellcheck disable=SC2086
-        "$MMSEQS" lin8-createtsv "$TMP/db" "$OUT" "$OUT.tsv" ${TSV_PAR} || fail "lin8-createtsv died"
+        "$MMSEQS" lin8-createtsv "$TMP/db" "$OUT" "$OUT.tsv" --threads "$THREADS" ${TSV_PAR} || fail "lin8-createtsv died"
     fi
 
     if [ "$REPSEQ" -eq 1 ] && notExists "$OUT.rep.fasta"; then
         # shellcheck disable=SC2086
-        "$MMSEQS" lin8-createrepseqfasta "$TMP/db" "$OUT" "$OUT.rep.fasta" ${REPSEQ_PAR} \
+        "$MMSEQS" lin8-createrepseqfasta "$TMP/db" "$OUT" "$OUT.rep.fasta" --threads "$THREADS" ${REPSEQ_PAR} \
             || fail "lin8-createrepseqfasta died"
     fi
 fi
@@ -316,8 +316,12 @@ if [ -n "$REMOVE_TMP" ]; then
                "$TMP/clu_accepted_plus_redundant"
         # the database stays until the clustering is named, because a cluster is named by rank
         rm -f "$TMP/hash" "$TMP/hash."* "$TMP/lin8clust.sh"
-        [ "$REPSEQ" -eq 0 ] && rm -f "$TMP/db" "$TMP/db".[0-9]* "$TMP/db.hist."* "$TMP/db.runs"* \
-            "$TMP/db.files" "$TMP/db.dbtype" "$TMP/db_h."*
+        if [ "$REPSEQ" -eq 0 ] && [ -f "$OUT.tsv" ]; then
+            rm -f "$TMP/db" "$TMP/db".[0-9]* "$TMP/db.hist."* "$TMP/db.runs"* \
+                "$TMP/db.files" "$TMP/db.dbtype" "$TMP/db_h."*
+        elif [ ! -f "$OUT.tsv" ]; then
+            echo "No TSV was written; keeping the sequence database and rank-to-name mapping at $TMP/db"
+        fi
     fi
 fi
 echo "machine $NODE finished"
