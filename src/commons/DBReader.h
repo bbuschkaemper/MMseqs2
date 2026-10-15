@@ -6,6 +6,7 @@
 // Manages DB read access.
 //
 #include "MemoryTracker.h"
+#include <cstring>
 #include <cstddef>
 #include <utility>
 #include <vector>
@@ -269,7 +270,7 @@ public:
         if (local2id != NULL) {
             return index[local2id[id]].length;
         }else if (index2dbfile != NULL) {
-            return index[findIdRange(id)].length;
+            return variableLength ? strlen(getDataUncompressed(id)) + 1 : index[findIdRange(id)].length;
         }else{
             return index[id].length;
         }
@@ -518,6 +519,7 @@ public:
 private:
     void checkClosed() const;
     size_t findIdRange(size_t id);
+    void readFrameTables();
 
     int threads;
 
@@ -570,6 +572,8 @@ private:
 
     // --createdb-mode 3: row i holds keys index[i].id .. index[i + 1].id - 1 of one length, from index[i].offset in <db>.<index2dbfile[i]>
     unsigned int * index2dbfile;
+    // --createdb-mode 3 headers: entries differ in length, so loadData records where each loaded id starts
+    bool variableLength;
     std::vector<int> dataFds;
     BatchReader * batchReader;
     char * loadedData;
@@ -577,6 +581,10 @@ private:
     std::vector<size_t> loadedFileOffsets;
     size_t loadedFrom;
     size_t loadedSize;
+    std::vector<size_t> loadedOffsets;
+    // --compress-headers: where every zstd frame of a data file starts, in the file and in its plain bytes
+    std::vector<std::vector<size_t>> frameStarts;
+    std::vector<std::vector<size_t>> plainFrameStarts;
 
     bool dataMapped;
     int accessType;

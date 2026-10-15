@@ -22,6 +22,7 @@ set(TESTS
         TestPSSM.cpp
         TestPSSMPrune.cpp
         TestDBReaderZstd.cpp
+        TestDBReaderLinfinity.cpp
         TestReduceMatrix.cpp
         TestScoreMatrixSerialization.cpp
         TestSequenceIndex.cpp

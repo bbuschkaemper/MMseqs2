@@ -29,7 +29,7 @@ threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
         indexFileName(strdup(indexFileName_)), size(0), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
         compressedBuffers(NULL), compressedBufferSizes(NULL), indexSize(0), index(NULL), id2local(NULL), local2id(NULL),
-        index2dbfile(NULL), batchReader(NULL), loadedData(NULL), loadedDataCapacity(0), loadedFrom(0), loadedSize(0), dataMapped(false), accessType(0), externalData(false), didMlock(false)
+        index2dbfile(NULL), variableLength(false), batchReader(NULL), loadedData(NULL), loadedDataCapacity(0), loadedFrom(0), loadedSize(0), dataMapped(false), accessType(0), externalData(false), didMlock(false)
 {}
 
 template <typename T>
@@ -38,7 +38,7 @@ DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T
         threads(threads), dataMode(USE_INDEX), dataFileName(NULL), indexFileName(NULL),
         size(size), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), indexSize(size), index(index), sortedByOffset(true),
-        id2local(NULL), local2id(NULL), index2dbfile(NULL), batchReader(NULL), loadedData(NULL), loadedDataCapacity(0), loadedFrom(0), loadedSize(0), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false)
+        id2local(NULL), local2id(NULL), index2dbfile(NULL), variableLength(false), batchReader(NULL), loadedData(NULL), loadedDataCapacity(0), loadedFrom(0), loadedSize(0), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false)
 {}
 
 template <typename T>
@@ -212,10 +212,8 @@ template <typename T> bool DBReader<T>::open(int accessType){
         incrementMemory(sizeof(Index) * indexSize);
 
         if (isLinfinity) {
-            if (Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_GENERIC_DB)) {
-                Debug(Debug::ERROR) << "Cannot open the headers of a --createdb-mode 3 database: " << indexFileName << "\n";
-                EXIT(EXIT_FAILURE);
-            }
+            // headers: the third column is the byte size of the whole bin, entries differ in length
+            variableLength = Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_GENERIC_DB);
             index2dbfile = new(std::nothrow) unsigned int[indexSize];
             Util::checkAllocation(index2dbfile, "Cannot allocate index memory in DBReader");
             incrementMemory(indexSize * sizeof(unsigned int));
@@ -241,8 +239,12 @@ template <typename T> bool DBReader<T>::open(int accessType){
                     EXIT(EXIT_FAILURE);
                 }
                 size += count;
-                dataSize += count * index[i].length;
-                maxSeqLen = std::max(maxSeqLen, index[i].length);
+                if (variableLength) {
+                    dataSize += index[i].length;
+                } else {
+                    dataSize += count * index[i].length;
+                    maxSeqLen = std::max(maxSeqLen, index[i].length);
+                }
                 indexDataChar = Util::skipLine(indexDataChar);
             }
             lastKey = (size == 0) ? 0 : size - 1;
@@ -283,6 +285,13 @@ template <typename T> bool DBReader<T>::open(int accessType){
     }
 
     compression = isCompressed(dbtype);
+    if (index2dbfile != NULL && compression == COMPRESSED) {
+        // --compress-headers: loadData decompresses whole zstd frames, so getData reads plain entries
+        compression = UNCOMPRESSED;
+        if (dataMode & USE_DATA) {
+            readFrameTables();
+        }
+    }
     padded = (getExtendedDbtype(dbtype) & Parameters::DBTYPE_EXTENDED_GPU);
     // A DB may pack two alphabets into a single byte (primary * auxAlphabetSize + aux, so
     // values run past 20); such a DB is flagged with Parameters::DBTYPE_EXTENDED_AUX_SEQ and
@@ -432,6 +441,9 @@ template <typename T> void DBReader<T>::close(){
     loadedData = NULL;
     loadedDataCapacity = 0;
     loadedFrom = loadedSize = 0;
+    loadedOffsets.clear();
+    frameStarts.clear();
+    plainFrameStarts.clear();
     closed = 1;
 }
 
@@ -548,6 +560,9 @@ template <typename T> char* DBReader<T>::getDataUncompressed(size_t id){
         if (id < loadedFrom || id >= loadedFrom + loadedSize) {
             Debug(Debug::ERROR) << "getData: local id (" << id << ") was not read by loadData from " << dataFileName << "\n";
             EXIT(EXIT_FAILURE);
+        }
+        if (variableLength) {
+            return loadedData + loadedOffsets[id - loadedFrom];
         }
         const size_t range = findIdRange(id);
         const size_t firstId = indexIdToNum(&index[range].id);
@@ -821,6 +836,50 @@ template <typename T> size_t DBReader<T>::findIdRange(size_t id) {
     return (range < indexSize && index[range].id == key) ? range : range - 1;
 }
 
+template <typename T> void DBReader<T>::readFrameTables() {
+    // seekable zstd: the frames, then a skippable frame with a (compressed, plain) size pair for every frame,
+    // ending in the frame count, a descriptor byte and the magic number
+    const uint32_t seekableMagic = 0x8F92EAB1;
+    frameStarts.assign(dataFileNames.size(), std::vector<size_t>(1, 0));
+    plainFrameStarts.assign(dataFileNames.size(), std::vector<size_t>(1, 0));
+    for (size_t file = 0; file < dataFileNames.size(); file++) {
+        const size_t fileSize = FileUtil::getFileSize(dataFileNames[file]);
+        FILE *handle = FileUtil::openFileOrDie(dataFileNames[file].c_str(), "r", true);
+        uint32_t frames = 0;
+        unsigned char descriptor = 0;
+        uint32_t magic = 0;
+        if (fileSize < 9 || fseek(handle, fileSize - 9, SEEK_SET) != 0
+            || fread(&frames, sizeof(uint32_t), 1, handle) != 1 || fread(&descriptor, 1, 1, handle) != 1
+            || fread(&magic, sizeof(uint32_t), 1, handle) != 1 || magic != seekableMagic) {
+            Debug(Debug::ERROR) << dataFileNames[file] << " is not a seekable zstd file\n";
+            EXIT(EXIT_FAILURE);
+        }
+        const size_t entryWords = (descriptor & 0x80) ? 3 : 2;
+        if (9 + 8 + static_cast<size_t>(frames) * entryWords * sizeof(uint32_t) > fileSize) {
+            Debug(Debug::ERROR) << "The seek table of " << dataFileNames[file] << " does not match the file size\n";
+            EXIT(EXIT_FAILURE);
+        }
+        std::vector<uint32_t> table(static_cast<size_t>(frames) * entryWords);
+        if (fseek(handle, fileSize - 9 - table.size() * sizeof(uint32_t), SEEK_SET) != 0
+            || fread(table.data(), sizeof(uint32_t), table.size(), handle) != table.size()) {
+            Debug(Debug::ERROR) << "Cannot read the seek table of " << dataFileNames[file] << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (fclose(handle) != 0) {
+            Debug(Debug::ERROR) << "Cannot close " << dataFileNames[file] << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        for (size_t frame = 0; frame < frames; frame++) {
+            frameStarts[file].push_back(frameStarts[file].back() + table[frame * entryWords]);
+            plainFrameStarts[file].push_back(plainFrameStarts[file].back() + table[frame * entryWords + 1]);
+        }
+        if (frameStarts[file].back() + 17 + table.size() * sizeof(uint32_t) != fileSize) {
+            Debug(Debug::ERROR) << "The seek table of " << dataFileNames[file] << " does not match the file size\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+}
+
 template <typename T> void DBReader<T>::loadData(size_t dbFrom, size_t dbSize) {
     if (index2dbfile == NULL || (dataMode & USE_DATA) == 0 || dbSize == 0) {
         return;
@@ -828,22 +887,46 @@ template <typename T> void DBReader<T>::loadData(size_t dbFrom, size_t dbSize) {
     const size_t dbTo = dbFrom + dbSize;
     const size_t firstRange = findIdRange(dbFrom);
     const size_t lastRange = findIdRange(dbTo - 1) + 1;
+    // the plain bytes [loadedFileOffsets[file], fileEnds[file]) of every file the ids lie in
     std::vector<size_t> fileEnds(dataFds.size(), 0);
     loadedFileOffsets.assign(dataFds.size(), 0);
     for (size_t range = firstRange; range < lastRange; range++) {
         const unsigned int file = index2dbfile[range];
         const size_t firstId = indexIdToNum(&index[range].id);
         const size_t endId = (range + 1 < indexSize) ? indexIdToNum(&index[range + 1].id) : size;
+        // shortcut: header bins are read whole, so a range starting inside a bin also reads the bin's head; record offsets per bin if callers load ranges much smaller than a bin
+        const size_t start = variableLength ? index[range].offset
+                                            : index[range].offset + (std::max(dbFrom, firstId) - firstId) * index[range].length;
+        const size_t end = variableLength ? index[range].offset + index[range].length
+                                          : index[range].offset + (std::min(dbTo, endId) - firstId) * index[range].length;
         if (fileEnds[file] == 0) {
-            loadedFileOffsets[file] = index[range].offset + (std::max(dbFrom, firstId) - firstId) * index[range].length;
+            loadedFileOffsets[file] = start;
         }
-        fileEnds[file] = index[range].offset + (std::min(dbTo, endId) - firstId) * index[range].length;
+        fileEnds[file] = end;
     }
     const size_t pageSize = Util::getPageSize();
+    const bool framed = frameStarts.empty() == false;
+    // a compressed file is read as the whole frames [frameFrom, frameTo) around its plain bytes
+    std::vector<size_t> frameFrom(dataFds.size(), 0);
+    std::vector<size_t> frameTo(dataFds.size(), 0);
     std::vector<size_t> fileStarts(dataFds.size() + 1, 0);
     for (size_t file = 0; file < dataFds.size(); file++) {
-        loadedFileOffsets[file] = loadedFileOffsets[file] / pageSize * pageSize;
-        fileStarts[file + 1] = fileStarts[file] + ((fileEnds[file] + pageSize - 1) / pageSize * pageSize - loadedFileOffsets[file]);
+        size_t bytes = 0;
+        if (fileEnds[file] > 0 && framed) {
+            const std::vector<size_t> &plain = plainFrameStarts[file];
+            if (fileEnds[file] > plain.back()) {
+                Debug(Debug::ERROR) << "The index of " << dataFileName << " points past the end of " << dataFileNames[file] << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            frameFrom[file] = std::upper_bound(plain.begin(), plain.end(), loadedFileOffsets[file]) - plain.begin() - 1;
+            frameTo[file] = std::lower_bound(plain.begin(), plain.end(), fileEnds[file]) - plain.begin();
+            loadedFileOffsets[file] = plain[frameFrom[file]];
+            bytes = plain[frameTo[file]] - loadedFileOffsets[file];
+        } else if (fileEnds[file] > 0) {
+            loadedFileOffsets[file] = loadedFileOffsets[file] / pageSize * pageSize;
+            bytes = fileEnds[file] - loadedFileOffsets[file];
+        }
+        fileStarts[file + 1] = fileStarts[file] + (bytes + pageSize - 1) / pageSize * pageSize;
     }
     const size_t bytes = fileStarts.back();
     if (bytes > loadedDataCapacity) {
@@ -857,15 +940,89 @@ template <typename T> void DBReader<T>::loadData(size_t dbFrom, size_t dbSize) {
         incrementMemory(bytes);
         loadedDataCapacity = bytes;
     }
+    // compressed frames go to their own page aligned buffer and are decompressed into loadedData
+    std::vector<size_t> compressedOffsets(dataFds.size(), 0);
+    std::vector<size_t> compressedStarts(dataFds.size() + 1, 0);
+    char *compressedData = NULL;
+    if (framed) {
+        for (size_t file = 0; file < dataFds.size(); file++) {
+            size_t compressedBytes = 0;
+            if (fileEnds[file] > 0) {
+                compressedOffsets[file] = frameStarts[file][frameFrom[file]] / pageSize * pageSize;
+                compressedBytes = frameStarts[file][frameTo[file]] - compressedOffsets[file];
+            }
+            compressedStarts[file + 1] = compressedStarts[file] + (compressedBytes + pageSize - 1) / pageSize * pageSize;
+        }
+        if (posix_memalign(reinterpret_cast<void **>(&compressedData), pageSize, std::max(compressedStarts.back(), pageSize)) != 0) {
+            Debug(Debug::ERROR) << "Cannot allocate " << compressedStarts.back() << " bytes to read " << dataFileName << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
     std::vector<BatchReader::Request> requests;
     for (size_t file = 0; file < dataFds.size(); file++) {
         dataFiles[file] = loadedData + fileStarts[file];
-        if (fileEnds[file] > 0) {
-            BatchReader::Request request = { dataFds[file], dataFiles[file], loadedFileOffsets[file], fileStarts[file + 1] - fileStarts[file], fileEnds[file] - loadedFileOffsets[file] };
+        if (fileEnds[file] == 0) {
+            continue;
+        }
+        if (framed) {
+            BatchReader::Request request = { dataFds[file], compressedData + compressedStarts[file], compressedOffsets[file],
+                                             compressedStarts[file + 1] - compressedStarts[file], frameStarts[file][frameTo[file]] - compressedOffsets[file] };
+            requests.push_back(request);
+        } else {
+            BatchReader::Request request = { dataFds[file], dataFiles[file], loadedFileOffsets[file],
+                                             fileStarts[file + 1] - fileStarts[file], fileEnds[file] - loadedFileOffsets[file] };
             requests.push_back(request);
         }
     }
     batchReader->read(requests, dataFileName);
+    if (framed) {
+        std::vector<std::pair<unsigned int, size_t>> frames;
+        for (unsigned int file = 0; file < dataFds.size(); file++) {
+            for (size_t frame = frameFrom[file]; fileEnds[file] > 0 && frame < frameTo[file]; frame++) {
+                frames.push_back(std::make_pair(file, frame));
+            }
+        }
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+        for (size_t i = 0; i < frames.size(); i++) {
+            const unsigned int file = frames[i].first;
+            const size_t frame = frames[i].second;
+            const size_t plainSize = plainFrameStarts[file][frame + 1] - plainFrameStarts[file][frame];
+            const size_t got = ZSTD_decompress(dataFiles[file] + (plainFrameStarts[file][frame] - loadedFileOffsets[file]), plainSize,
+                                               compressedData + compressedStarts[file] + (frameStarts[file][frame] - compressedOffsets[file]),
+                                               frameStarts[file][frame + 1] - frameStarts[file][frame]);
+            if (ZSTD_isError(got) || got != plainSize) {
+                Debug(Debug::ERROR) << "Cannot decompress frame " << frame << " of " << dataFileNames[file] << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+        free(compressedData);
+    }
+    if (variableLength) {
+        loadedOffsets.resize(dbSize);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+        for (size_t range = firstRange; range < lastRange; range++) {
+            const unsigned int file = index2dbfile[range];
+            const size_t firstId = indexIdToNum(&index[range].id);
+            const size_t endId = (range + 1 < indexSize) ? indexIdToNum(&index[range + 1].id) : size;
+            const char *entry = dataFiles[file] + (index[range].offset - loadedFileOffsets[file]);
+            const char *binEnd = entry + index[range].length;
+            for (size_t id = firstId; id < std::min(dbTo, endId); id++) {
+                const char *next = static_cast<const char *>(memchr(entry, '\0', binEnd - entry));
+                if (next == NULL) {
+                    Debug(Debug::ERROR) << "The header bin of key " << firstId << " in " << dataFileName << " ends inside an entry\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                if (id >= dbFrom) {
+                    loadedOffsets[id - dbFrom] = entry - loadedData;
+                }
+                entry = next + 1;
+            }
+            if (endId <= dbTo && entry != binEnd) {
+                Debug(Debug::ERROR) << "The header bin of key " << firstId << " in " << dataFileName << " has more bytes than entries\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+    }
     loadedFrom = dbFrom;
     loadedSize = dbSize;
 }
