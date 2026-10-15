@@ -863,7 +863,7 @@ int createdbLinfinity(Parameters &par, const std::vector<std::string> &filenames
         MMseqsNode::publishFile(dataFile + ".source", sourceData);
         const int dbType = DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS, Parameters::DBTYPE_EXTENDED_LINFINITY);
         DBWriter::writeDbtypeFile(dataFile.c_str(), dbType, false);
-        DBWriter::writeDbtypeFile((dataFile + "_h").c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_GENERIC_DB, Parameters::DBTYPE_EXTENDED_LINFINITY), false);
+        DBWriter::writeDbtypeFile((dataFile + "_h").c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_GENERIC_DB, Parameters::DBTYPE_EXTENDED_LINFINITY), par.compressHeaders);
         Debug(Debug::INFO) << "Database type: " << Parameters::getDbTypeName(dbType) << "\n";
     }
 
