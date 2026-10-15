@@ -651,6 +651,7 @@ Parameters::Parameters():
     createtsv.push_back(&PARAM_IDX_SEQ_SRC);
     createtsv.push_back(&PARAM_DB_OUTPUT);
     createtsv.push_back(&PARAM_PRELOAD_MODE);
+    createtsv.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     createtsv.push_back(&PARAM_THREADS);
     createtsv.push_back(&PARAM_COMPRESSED);
     createtsv.push_back(&PARAM_V);
