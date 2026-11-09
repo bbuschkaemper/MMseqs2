@@ -752,7 +752,8 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             EXIT(EXIT_FAILURE);
         }
     } else if (hasLocalTmp) {
-        Debug(Debug::INFO) << "Not spooling the sent sequences to " << par.localTmp << ": " << nodeReason << "\n";
+        // every node sees the same nodeReason, so all of them stop or all go on
+        MMseqsNode::reportUnusableLocalTmp(par.localTmpFallback, "Cannot spool the sent sequences to --local-tmp " + par.localTmp + ": " + nodeReason);
     }
     bool isSpooled = spoolHandle != exchangeHandle;
     size_t spoolBytes = 0;

@@ -637,6 +637,15 @@ void MMseqsNode::WorkQueue::removeTakenItemFiles() {
     }
 }
 
+void MMseqsNode::reportUnusableLocalTmp(bool fallback, const std::string &problem) {
+    if (fallback) {
+        Debug(Debug::WARNING) << problem << "; using the shared folder instead\n";
+        return;
+    }
+    Debug(Debug::ERROR) << problem << ". Pass --local-tmp-fallback 1 to use the shared folder instead\n";
+    EXIT(EXIT_FAILURE);
+}
+
 size_t MMseqsNode::getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads, const std::string &localDirectory, size_t *localNodes) {
     std::string localDevice;
     int fd = localDirectory.empty() ? -1 : open(localDirectory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);

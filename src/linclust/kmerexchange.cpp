@@ -2930,6 +2930,10 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     }
     size_t localNodes = 0;
     size_t minPassLimit = std::max((size_t) 1, getPassLimit(MMseqsNode::getSmallestMemoryLimit(par.db2 + ".memory", memoryLimit, par.threads, par.localTmp, &localNodes)));
+    // localNodes counts this node too when its --local-tmp is local flash, so 0 means it is not
+    if (par.localTmp.empty() == false && localNodes == 0) {
+        MMseqsNode::reportUnusableLocalTmp(par.localTmpFallback, "Cannot keep the last exchange file groups in --local-tmp " + par.localTmp + ": it is not local flash");
+    }
     size_t passes = std::max((size_t) 1, (totalKmerCount * receiverKmerSize + minPassLimit - 1) / minPassLimit);
     exchange.hashSubRangesPerRange = (std::max(passes, exchange.hashRangeCount) * TASKS_PER_THREAD * par.threads + exchange.hashRangeCount - 1) / exchange.hashRangeCount;
     exchange.hashSubRangeCount = exchange.hashRangeCount * exchange.hashSubRangesPerRange;

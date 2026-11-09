@@ -3198,9 +3198,10 @@ int align2clustLinfinity(Parameters &par) {
         const bool isDbDevice = fstat(localTmpFd, &localTmpStat) == 0 && stat(par.db1Index.c_str(), &dbStat) == 0 && localTmpStat.st_dev == dbStat.st_dev;
         close(localTmpFd);
         if (localTmpStorage != STORAGE_LOCAL_FLASH) {
-            Debug(Debug::WARNING) << "Not copying the served blocks to " << par.localTmp << ": it is on " << getStorageName(localTmpStorage) << ", not local flash\n";
+            MMseqsNode::reportUnusableLocalTmp(par.localTmpFallback, "Cannot copy the served blocks to --local-tmp " + par.localTmp + ": it is on "
+                                                                     + getStorageName(localTmpStorage) + ", not local flash");
         } else if (isDbDevice) {
-            Debug(Debug::WARNING) << "Not copying the served blocks to " << par.localTmp << ": it is on the device of the database\n";
+            MMseqsNode::reportUnusableLocalTmp(par.localTmpFallback, "Cannot copy the served blocks to --local-tmp " + par.localTmp + ": it is on the device of the database");
         } else {
             // copy only the served blocks
             DBReader<DBKeyType> blockDbr(par.db1.c_str(), par.db1Index.c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
@@ -3231,7 +3232,8 @@ int align2clustLinfinity(Parameters &par) {
             struct statvfs fs;
             const size_t freeSize = (statvfs(par.localTmp.c_str(), &fs) == 0) ? static_cast<size_t>(fs.f_bavail) * fs.f_frsize : 0;
             if (freeSize < servedSize) {
-                Debug(Debug::WARNING) << "Not copying the served blocks to " << par.localTmp << ": it has " << freeSize << " free bytes, the served blocks need " << servedSize << "\n";
+                MMseqsNode::reportUnusableLocalTmp(par.localTmpFallback, "Cannot copy the served blocks to --local-tmp " + par.localTmp + ": it has " + SSTR(freeSize)
+                                                                         + " free bytes, the served blocks need " + SSTR(servedSize));
             } else {
                 seqDb = FileUtil::copyToLocalDir(par.db1, par.localTmp + "/" + FileUtil::baseName(par.db3) + "." + SSTR(MMseqsNode::rank), par.threads, localCopies, localCopySize, &servedFileRanges);
                 hasLocalServedBlocks = true;

@@ -44,6 +44,8 @@ public:
     }
 
     static void sleepBeforePoll(unsigned int polls, unsigned int maxShift = 4);
+    // a --local-tmp that cannot be used stops the run, unless --local-tmp-fallback 1 lets it use the shared folder instead
+    static void reportUnusableLocalTmp(bool fallback, const std::string &problem);
 
     class WaitWarning {
     public:
